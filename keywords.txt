@@ -1,0 +1,84 @@
+#######################################
+# Syntax Coloring Map For Guard_ESP
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+Guard_ESP	KEYWORD1
+GE_ProfilId	KEYWORD1
+GE_Refus	KEYWORD1
+GE_RouteStat	KEYWORD1
+GE_WebGuard	KEYWORD1
+GE_AsyncWebGuard	KEYWORD1
+GE_McpFlow	KEYWORD1
+GE_ServerPrint	KEYWORD1
+GE_ChunkPrint	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+profil	KEYWORD2
+regler	KEYWORD2
+autoCalibrer	KEYWORD2
+setGarde	KEYWORD2
+setBackoff	KEYWORD2
+setInactivite	KEYWORD2
+demarrer	KEYWORD2
+admit	KEYWORD2
+sortir	KEYWORD2
+tick	KEYWORD2
+activite	KEYWORD2
+enPression	KEYWORD2
+gardePassee	KEYWORD2
+refus	KEYWORD2
+refusTexte	KEYWORD2
+retryAfterMs	KEYWORD2
+resume	KEYWORD2
+route	KEYWORD2
+routeOk	KEYWORD2
+routeKo	KEYWORD2
+admis	KEYWORD2
+rejetes	KEYWORD2
+rejets	KEYWORD2
+dureePire	KEYWORD2
+depassements	KEYWORD2
+inactif	KEYWORD2
+inactiviteMs	KEYWORD2
+canaux	KEYWORD2
+fenetreMs	KEYWORD2
+maxSousPression	KEYWORD2
+chargeCourante	KEYWORD2
+xoff	KEYWORD2
+profilTexte	KEYWORD2
+appliquer	KEYWORD2
+fin	KEYWORD2
+vider	KEYWORD2
+heapLibre	KEYWORD2
+blocLibre	KEYWORD2
+poidsLeger	KEYWORD2
+poidsMoyen	KEYWORD2
+poidsLourd	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+GE_VERSION	LITERAL1
+GE_BUCKETS	LITERAL1
+GE_ROUTES	LITERAL1
+GE_PRINT_BUF	LITERAL1
+GE_PROFIL_AUTO	LITERAL1
+GE_PROFIL_ESP8266	LITERAL1
+GE_PROFIL_ESP32	LITERAL1
+GE_REFUS_AUCUN	LITERAL1
+GE_REFUS_FLUX	LITERAL1
+GE_REFUS_POIDS	LITERAL1
+GE_REFUS_PRESSION	LITERAL1
+GE_REFUS_CONCURRENCE	LITERAL1
+GE_REFUS_BODY	LITERAL1
+GE_REFUS_BACKOFF	LITERAL1
+GE_REFUS_GARDE	LITERAL1
+GE_REFUS_DUREE	LITERAL1
