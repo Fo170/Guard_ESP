@@ -8,6 +8,10 @@
 //
 // ⚠️ Le WrapperPrint existant alloue encore (`String s; s.reserve(size)`)
 //    pour les écritures >= 128 o. Ici : aucune allocation, jamais.
+//
+// ⚠️ Le destructeur VIDE le tampon : sans cela, les derniers octets
+//    étaient perdus silencieusement (finding W14) — exactement le mode
+//    d'échec « corps tronqué » que cette classe existe pour supprimer.
 // ════════════════════════════════════════════════════════════════
 
 #ifndef GUARD_ESP_PRINT_H
@@ -19,12 +23,19 @@
 #define GE_PRINT_BUF 192
 #endif
 
-// Écrit par blocs vers un serveur exposant sendContent().
-// Compatible ESP8266WebServer, WebServer (ESP32) et AsyncWebServer.
+static_assert(GE_PRINT_BUF >= 16, "GE_PRINT_BUF doit etre >= 16");
+
+// Écrit par blocs vers un serveur exposant sendContent(const char*, size_t).
+// Compatible ESP8266WebServer et WebServer (ESP32).
+// ⚠️ PAS AsyncWebServer : cette classe n'expose pas sendContent().
 template <typename ServerType>
 class GE_ServerPrint : public Print {
 public:
-  explicit GE_ServerPrint(ServerType& s) : _srv(s) {}
+  explicit GE_ServerPrint(ServerType& s) : _srv(&s) {}
+  ~GE_ServerPrint() { vider(); }
+
+  GE_ServerPrint(const GE_ServerPrint&) = delete;
+  GE_ServerPrint& operator=(const GE_ServerPrint&) = delete;
 
   size_t write(uint8_t c) override {
     _buf[_len++] = (char)c;
@@ -46,8 +57,8 @@ public:
   }
 
   void vider() {
-    if (_len) {
-      _srv.sendContent(_buf, _len);
+    if (_len && _srv) {
+      _srv->sendContent(_buf, _len);
       _len = 0;
     }
   }
@@ -57,20 +68,27 @@ public:
   size_t enAttente() const { return _len; }
 
 private:
-  ServerType& _srv;
-  char   _buf[GE_PRINT_BUF];
-  size_t _len = 0;
+  ServerType* _srv;
+  char        _buf[GE_PRINT_BUF];
+  size_t      _len = 0;
 };
 
 // Écrit par blocs vers un Print quelconque (Serial, SerialWeb, fichier).
+// Contrairement à GE_ServerPrint, write() propage l'échec de la cible :
+// si la cible n'accepte plus d'octets, write() retourne 0 au lieu de
+// prétendre avoir tout écrit (finding W14).
 class GE_ChunkPrint : public Print {
 public:
-  explicit GE_ChunkPrint(Print& cible) : _out(cible) {}
+  explicit GE_ChunkPrint(Print& cible) : _out(&cible) {}
+  ~GE_ChunkPrint() { vider(); }
+
+  GE_ChunkPrint(const GE_ChunkPrint&) = delete;
+  GE_ChunkPrint& operator=(const GE_ChunkPrint&) = delete;
 
   size_t write(uint8_t c) override {
     _buf[_len++] = (char)c;
     if (_len >= sizeof(_buf)) vider();
-    return 1;
+    return _erreur ? 0 : 1;
   }
 
   size_t write(const uint8_t* data, size_t n) override {
@@ -83,22 +101,30 @@ public:
       i += bloc;
       if (_len >= sizeof(_buf)) vider();
     }
-    return n;
+    return _erreur ? 0 : n;
   }
 
   void vider() {
-    if (_len) {
-      _out.write((const uint8_t*)_buf, _len);
+    if (_len && _out) {
+      size_t ecrit = _out->write((const uint8_t*)_buf, _len);
+      if (ecrit != _len) _erreur = true;
       _len = 0;
     }
   }
 
-  void flush() override { vider(); }
+  void flush() override {
+    vider();
+    if (_out) _out->flush();
+  }
+
+  bool erreur() const { return _erreur; }
+  size_t enAttente() const { return _len; }
 
 private:
-  Print& _out;
+  Print* _out;
   char   _buf[GE_PRINT_BUF];
-  size_t _len = 0;
+  size_t _len    = 0;
+  bool   _erreur = false;
 };
 
 // ────────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 {
   "name": "Guard_ESP",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Protection anti-OOM / anti-freeze / anti-rafale pour ESP8266 et ESP32 : fenêtre glissante pondérée (429 + Retry-After), backpressure mémoire XON/XOFF (heap ET bloc contigu), plafond de concurrence (503), garde de durée, garde de démarrage, watchdog d'inactivité, compteurs par route. Header-only, zéro allocation dynamique.",
   "keywords": [
     "guard",

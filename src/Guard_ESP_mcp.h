@@ -11,6 +11,14 @@
 //
 // Aucune dépendance dure : le type MCP est un paramètre de template,
 // donc ce header n'inclut pas Server_MCP.h.
+//
+// ⚠️ Le callback de pression de Server_MCP a la signature imposée
+//    bool(*)(), sans paramètre. Il ne peut donc pas recevoir l'instance
+//    du garde : on passe par un pointeur statique, armé par appliquer().
+//    L'ancienne version utilisait guardInstance() en dur, ce qui faisait
+//    observer une SECONDE instance non configurée dès que l'application
+//    déclarait `Guard_ESP guard;` (cas de l'exemple 02) → sur ESP8266 le
+//    callback voyait le profil ESP32 (XOFF 25 000 o) et refusait tout.
 // ════════════════════════════════════════════════════════════════
 
 #ifndef GUARD_ESP_MCP_H
@@ -19,9 +27,23 @@
 #include <Arduino.h>
 #include "Guard_ESP.h"
 
+// Instance observée par le callback de pression (voir avertissement ci-dessus).
+inline Guard_ESP*& GE_InstancePression() {
+  static Guard_ESP* p = nullptr;
+  return p;
+}
+
 // Callback de pression mémoire attendu par Server_MCP::setFlowPression().
-// Signature imposée : bool(*)() — d'où le passage par l'instance globale.
-inline bool GE_PressionCb() { return guardInstance().enPression(); }
+inline bool GE_PressionCb() {
+  Guard_ESP* g = GE_InstancePression();
+  if (!g) g = &guardInstance();
+  return g->enPression();
+}
+
+// Variante testable : interroge explicitement une instance.
+inline bool GE_PressionCb(Guard_ESP* g) {
+  return g ? g->enPression() : false;
+}
 
 template <typename McpType>
 class GE_McpFlow {
@@ -30,6 +52,7 @@ public:
 
   // À appeler dans INIT_MCP(), AVANT mcp.begin().
   void appliquer(McpType& mcp) {
+    GE_InstancePression() = &_g;          // le callback observe CETTE instance
     mcp.setFlowControl(_g.canaux(), _g.fenetreMs());
     mcp.setFlowPression(GE_PressionCb, _g.maxSousPression());
     _applique = true;

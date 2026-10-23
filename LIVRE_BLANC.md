@@ -1,6 +1,6 @@
 # Livre blanc — Robustesse des IoT ESP8266 / ESP32
 
-> Document de référence de `Guard_ESP`. Il recense les **34 problèmes réels**
+> Document de référence de `Guard_ESP`. Il recense les **49 problèmes réels**
 > rencontrés sur le parc, les **12 bonnes pratiques** qui en découlent, les
 > **valeurs de réglage typiques** par plateforme, et la **matrice de
 > traçabilité** entre chaque mécanisme de la librairie et le problème qu'il
@@ -20,7 +20,7 @@ Deux librairies, deux responsabilités opposées :
 | Verbe | **Observer** | **Protéger** |
 | Nature | passif — ne modifie rien | actif — refuse une requête |
 | Moment | **après** l'incident (dump au boot suivant) | **avant** l'incident |
-| API | `CM_Statut()`, `CM_HeapOKBloc()` | `guard.admit()`, `guard.reject()` |
+| API | `CM_Statut()`, `CM_HeapOKBloc()` | `guard.admit()`, `guard.ticket()` |
 | En cas de panne | rien n'est cassé | laisse passer **ou** bloque tout |
 
 La dépendance est **optionnelle et à sens unique** :
@@ -29,7 +29,7 @@ La dépendance est **optionnelle et à sens unique** :
 
 ---
 
-## 1. Taxonomie — 8 familles, 34 problèmes
+## 1. Taxonomie — 8 familles, 49 problèmes
 
 ### Famille 1 — Épuisement mémoire (12)
 
@@ -214,7 +214,7 @@ le bloc contigu. Le régime permanent, lui, est à 53 Ko.
 
 | Paramètre | Valeur | Justification |
 |---|---|---|
-| **Concurrence** | **2 à 4** | dual-core : web cœur 0, métier cœur 1 |
+| **Concurrence** | **3** | dual-core : web cœur 0, métier cœur 1 |
 | Canaux / fenêtre | **8 / 30 s** | valeur éprouvée sur les 2 ESP32 |
 | XOFF — heap | **25 000 o** | validé Telegram (35 Ko = trop haut) |
 | XOFF — **bloc contigu** | **12 000 o** | ⚠️ indispensable |
@@ -238,10 +238,9 @@ le bloc contigu. Le régime permanent, lui, est à 53 Ko.
 
 ```cpp
 guard.autoCalibrer();   // H_ref = heap après init WiFi + services
-// → XOFF      = H_ref × 0.75
-// → refus     = H_ref × 0.55
-// → bloc mini = H_ref × 0.35
-// → canaux    = H_ref > 20000 ? 8 : (H_ref > 10000 ? 6 : 4)
+// → heapXoff    = H_ref × 0,75      blocXoff  = H_ref × 0,35
+// → gardeHeap   = H_ref × 0,55      gardeBloc = H_ref × 0,25
+// → canaux      = H_ref > 20000 ? 8 : (H_ref > 10000 ? 6 : 4)
 // → concurrence = H_ref > 20000 ? 3 : 1
 ```
 
@@ -250,7 +249,7 @@ Vérification sur les mesures réelles :
 | Appareil | H_ref | XOFF calculé | Régime | Canaux |
 |---|---|---|---|---|
 | Salon | 4 700 | 3 525 | 4 576 ✅ sous le régime | 4 |
-| Relais | 20 300 | 15 225 | 20 288 ✅ | 6 |
+| Relais | 20 300 | 15 225 | 20 288 ✅ | 8 |
 | Telegram | 76 800 | 57 600 | 76 636 ✅ | 8 |
 
 ### 3.6 Anti-patrons de réglage
@@ -306,7 +305,7 @@ Pour rester honnête sur le périmètre :
 
 ## 6. Limites de ce document
 
-- Les 34 problèmes viennent de **4 projets sur 8**. `PZEM004T`, `Station_Meteo`,
+- Les 49 problèmes viennent de **4 projets sur 8**. `PZEM004T`, `Station_Meteo`,
   `Surveillance_Batterie` et `Relais-WIFI` n'ont **aucun historique écrit** :
   leur absence de limiteur est un **risque non documenté**, pas une absence de
   risque.

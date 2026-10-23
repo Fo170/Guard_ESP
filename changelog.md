@@ -5,6 +5,115 @@ Format : une section par version, avec les vérifications associées.
 
 ---
 
+## 2026-10-22 — v1.1.0 (cycle de chasse aux bugs n°1)
+
+Premier cycle `code-reviews-openfox`. **5 findings critiques** et **17
+avertissements** corrigés, dont trois défauts qui annulaient partiellement la
+promesse de la v1.0.0.
+
+### Critiques
+
+| # | Finding | Cause | Correctif | Preuve |
+|---|---|---|---|---|
+| C1 | Fenêtre glissante laissant passer **2× le quota** : 8 requêtes admises en 26 254 ms (quota 4/30 000) | Un seau était remis à zéro `GE_BUCKETS × bucketMs` après son **début**, donc un événement du début du seau n'était compté que 7/8 de fenêtre | Anneau de **`GE_BUCKETS + 1`** seaux : un seau n'est purgé qu'après `(GE_BUCKETS+1)` rotations, donc tout événement reste compté **au moins** `_fenetreMs` | Test `T15` : 4 admis à `+3 749 ms`, 4 à `+30 003 ms` → **0 admis** au 2ᵉ lot |
+| C2 | Fuite de slot de concurrence : `actifs=1` après 2 `admit()` + 2 `fin()` | L'état « ouvert » était un `bool` **par instance d'adaptateur**, écrasé par toute requête concurrente | **`GE_Ticket`** (RAII) : le jeton porte **son** index de slot, la libération est exacte à la destruction | Test `T16` : 2 tickets → `actifs=0` après destruction |
+| C3 | Noyau non thread-safe alors que l'en-tête annonçait « réentrant » | Aucun verrou ; sur ESP32 + AsyncWebServer les callbacks tournent dans `async_tcp`, en parallèle de `loop()` | Verrou **`portMUX`** (ESP32) / sans objet (ESP8266) sur `admitInterne`, `sortir`, `tick`, `route`, `routeOk`, `routeKo` ; mention « réentrant » **supprimée** | `grep -ci reentrant` = 0 ; `GE_VERROU` présent dans 6 fonctions |
+| C4 | `admit()` retournait `true` sans slot quand `!_actif` → `dureePire = 105 000 ms` | Contrat « true = slot acquis » violé | Compteur **`_slotsSansMesure`** : `sortir()` le consomme sans mesurer de durée | Test `T17` : `dureePire=0`, `depassements=0` |
+| C5 | `_bucket[]` non initialisé → **100 % de refus FLUX** sans `demarrer()` | Tableau sans initialiseur (contrairement à `_routes[]`) | `uint16_t _bucket[GE_BUCKETS+1] = {}` | Test `T18` : `admit()` fonctionne sans `demarrer()` |
+
+### Avertissements
+
+| # | Finding | Correctif | Preuve |
+|---|---|---|---|
+| W1 | `sortir()` sans `admit()` fabriquait une durée (`dureePire = millis()`) | Sortie anticipée si le slot n'est pas marqué occupé | `T19` |
+| W2 | Un seul `_reqStart` pour N slots → garde de durée aveugle dès `_concurrence > 1` | Tableau **`_slotStart[GE_SLOTS]`** + `_slotBusy[]` : un temps de départ par slot | `T20` |
+| W3 | `tick()` puis `sortir()` comptaient deux fois le dépassement | `tick()` marque les slots libres ; `sortir()` sort tôt si le slot n'est plus occupé | `T21` |
+| W4 | `_xoff` périmé sur BACKOFF / GARDE / CONCURRENCE / BODY | Un seul échantillonnage mémoire en tête d'`admit()`, publié sur **toutes** les sorties | `T22` |
+| W5 | `GE_BUCKETS`/`GE_ROUTES` ≥ 256 → **boucle infinie** (`for (uint8_t i…)`) ; `int8_t _routeCur` perdait les routes ≥ 128 | `static_assert` de bornes hautes + compteurs `uint16_t` | `-DGE_BUCKETS=256` → **échec de compilation** |
+| W6 | `resume()` retournait 191 pour `buf[20]` et affichait le seau courant au lieu de la charge | Retour `min(n, len-1)` ; charge = somme de l'anneau | `T23` |
+| W7 | `GE_PressionCb()` observait `guardInstance()` au lieu de l'instance de l'adaptateur → sur ESP8266, XOFF permanent | `GE_InstancePression()` armé par `appliquer()` ; surcharge `GE_PressionCb(Guard_ESP*)` | `T24` |
+| W8 | ~9 `String` allouées par refus web, **au pire moment** | En-têtes émis **uniquement hors pression** (`!_g.enPression()`) | `T25` : 36 en-têtes hors pression, **0** sous pression |
+| W9 | `GE_AsyncWebGuard` **ne compilait pas** (`typename RequestType::Response` inexistant) | `auto*` sur le retour de `beginResponse()` | `T26` compile et refuse |
+| W10 | `_poidsMax`, `_heapRefus`, `_blocRefus` écrits mais **jamais lus** | `_poidsMax` appliqué dans `admit()` ; `profil()` arme la garde avec les seuils « refus total » | `T27` |
+| W11 | `route()` comparait les **pointeurs** → routes distinctes confondues | Comparaison par `strcmp` uniquement + drapeau `routesSaturees()` | `T28` |
+| W12 | `autoCalibrer()` écrasait `regler()` et la garde valait 0,14·H au lieu de 0,35·H | Les 4 formules documentées appliquées exactement : 0,75 / 0,35 / 0,55 / 0,25 × H_ref | `T29` |
+| W13 | `regler()` tronquait `concurrence` (300 → 44) et ne bornait pas `partHeap` | Validation complète ; retour `false` et **configuration conservée** | `T30` |
+| W14 | Destructeurs de `GE_ServerPrint`/`GE_ChunkPrint` ne vidaient pas le tampon ; `write()` masquait l'échec | Destructeurs → `vider()` ; `GE_ChunkPrint::write()` retourne 0 si la cible refuse | `T31` |
+| W15 | `GE_REFUS_DUREE` inatteignable (aucun `refuser()` ne l'émettait) | Cause **supprimée** ; remplacée par `GE_REFUS_INACTIF` | `grep -c GE_REFUS_DUREE` = 0 |
+| W16 | Exemple 01 refusé en `BODY` sur 4,7 Ko (`taille=1200` > 25 % du heap) | `taille` = **plus gros bloc alloué** (192 o), sémantique documentée | `T32` + build |
+| W17 | 10 écarts documentation ↔ code | Tous corrigés (voir plus bas) | Revue + `grep` |
+
+### Suggestions retenues
+
+| # | Finding | Correctif |
+|---|---|---|
+| S1 | heap/bloc interrogés jusqu'à 5× par décision | **1 seul** échantillonnage par `admit()` |
+| S2 | `regler()` changeait `_bucketMs` sans invalider la fenêtre | `regler()` vide la fenêtre |
+| S3 | `sizeof < 300` vérifié à l'exécution | `static_assert(sizeof(Guard_ESP) < 300)` |
+| S4 | `X-RateLimit-Remaining` manquant | En-tête ajouté + `creditRestant()` |
+
+### Documentation corrigée (W17)
+
+| Écart | Correction |
+|---|---|
+| « réutilise `Crash_ESP_Monitor` via `__has_include` » | Le code est **totalement autonome** ; aucun `__has_include` |
+| `guard.reject()` dans le livre blanc | Remplacé par `guard.ticket()` |
+| « 34 problèmes » | **49** (comptage réel des tableaux) |
+| Formules d'`autoCalibrer()` (garde 0,35·H) | 0,75 / 0,35 / 0,55 / 0,25 × H_ref, explicitées |
+| Relais 20 300 o → « 6 canaux » | **8** canaux (le code donne 8) |
+| `tick()` présenté comme « watchdog d'inactivité » | Libère les slots bloqués ; le watchdog est `inactif()` |
+| `GE_ServerPrint` « compatible AsyncWebServer » | **Non** : `AsyncWebServer` n'expose pas `sendContent()` |
+| Concurrence ESP32 « 2–4 » | **3** (valeur réelle du profil) |
+| Table API partielle | 15 méthodes ajoutées, dont `heapXoff()`, `creditRestant()`, `routesSaturees()` |
+| `GE_REFUS_DUREE` documenté | Retiré (cause supprimée) |
+
+### Cycle 2 (relecture de clôture) — 2 critiques introduits par les correctifs
+
+La relecture de clôture a trouvé que deux correctifs du cycle 1 avaient
+eux-mêmes introduit des défauts. Corrigés dans la même version.
+
+| # | Finding | Cause | Correctif | Preuve |
+|---|---|---|---|---|
+| 28 | `GE_Ticket` d'un garde inactif **falsy** : le jeton était construit avec `idx = AUCUN` alors que `_slotsSansMesure` avait été incrémenté → compteur fantôme jamais décrémenté, et `GE_WebGuard` répondait 503 « protection désactivée » à une requête **admise** | L'état fictif était porté par un compteur global, pas par le slot | **`_slotFictif[GE_SLOTS]`** : un slot fictif est réellement alloué (ticket vrai, libération symétrique) mais sa durée n'est pas mesurée. `_slotsSansMesure` supprimé | `T36` : ticket vrai, `actifs=0` après destruction, `dureePire=0` |
+| 29 | `_slotsSansMesure` global : si `_actif` bascule entre `admit()` et `sortir()`, la libération est attribuée à la **mauvaise** requête → slot fuyé | Compteur global au lieu d'un état par slot | idem (état porté par le slot) | `T36` : bascule `_actif` → 2 slots, libérations correctes |
+| 30 | `tick()` remettait `_actifs = 0` au lieu de décrémenter → **plafond de concurrence contourné** (4 slots simultanés pour `concurrence()==3`) | Remise à zéro globale | Décrément par slot réellement libéré | `T37` : 3 slots max, 4ᵉ refusé |
+| 31 | `refuser()` était appelé **hors verrou** → compteurs perdus sous concurrence | Sorties d'`admitInterne` après `GE_DEVERROU` | `refuserSousVerrou()` : la cause et les compteurs sont écrits **verrou tenu**, la fonction rend le verrou | revue : 1 entrée / 1 sortie par chemin |
+| 32 | `chargeCourante()`/`creditRestant()`/`resume()` sont **mutants** (appellent `avancer()`) et n'étaient pas verrouillés | Accesseurs présentés comme de simples getters | Verrouillés et documentés comme mutants | commentaire d'en-tête + README |
+| 33 | `profil()`/`autoCalibrer()` ignoraient l'échec de `regler()` → garde armée incohérente avec le XOFF (motif de l'incident du 01/09) | Retour `bool` non testé | `borneConcurrence()` ramène la valeur dans `[1, GE_SLOTS]` ; `autoCalibrer()` n'arme la garde que si `regler()` a réussi | `T29`, `T11` |
+| 34 | Piège de migration muet : `if (!wguard.admit(...)) return;` compile et rend le slot **avant** le traitement | Ticket détruit en fin d'instruction | `GE_NODISCARD` (`warn_unused_result`) sur `admit()`/`ticket()` + README corrigé | warning à la compilation |
+| 35 | README montrait l'API supprimée (`fin()`), omettait `X-RateLimit-Remaining`, annonçait 232 octets | Doc non migrée | README réécrit (ticket, 256 octets, en-têtes conditionnels, accesseurs mutants) | `grep -c "fin()"` = 0 |
+| 36 | `GE_ServerPrint::write()` retournait toujours `n` (échec silencieux) | Retour de `sendContent()` ignoré | `_erreur` positionné si `sendContent()` écrit moins que demandé | `T31` |
+| 37 | `resume()` sommait `_bucket[]` sans vieillir la fenêtre → « charge 4/4 » après 10 min d'inactivité | Fonction `const` | `resume()` devient **mutant** et appelle `avancer()` | `T13` |
+| 39 | `retryAfterMs()` = 30 000 ms alors qu'un événement reste compté 33 750 ms → le client qui respecte l'en-tête est refusé une 2ᵉ fois | Anneau de 9 seaux non pris en compte | `retryAfterMs()` = `GE_RING × _bucketMs` | `T1` |
+| 41 | `heapLibre()`/`blocLibre()` appelés **dans** la section critique | Échantillonnage après verrou | Échantillonnage **avant** `GE_VERROU` | revue |
+| 48 | `GE_SLOTS` validé jusqu'à 16 alors que `sizeof` échoue dès 14 | Borne incohérente avec le `static_assert` d'empreinte | Borne ramenée à **13** | `-DGE_SLOTS=32` rejeté |
+
+Reportés (hors périmètre de ce cycle, consignés) :
+- `Guard_ESP` reste copiable alors qu'il contient un `portMUX` et que des
+  tickets pointent dessus — à traiter si un usage le justifie (aucun aujourd'hui).
+- `GE_McpFlow` n'arme pas de désarmement du pointeur d'instance.
+- Politiques d'en-têtes divergentes entre adaptateurs sync et async.
+
+### Changement d'API (rupture assumée)
+
+`GE_WebGuard::admit()` et `GE_AsyncWebGuard::admit()` retournent désormais un
+**`GE_Ticket`** au lieu d'un `bool`, et `fin()` disparaît. Motif : l'ancien
+couple stockait l'état ouvert dans un booléen par instance, ce qui perdait des
+slots (finding C2). Aucun consommateur n'existait (lib publiée la veille).
+`Guard_ESP::admit()`, `sortir()` et `resume()` sont **inchangés**.
+
+### Vérifications
+
+- Tests hôte : **149/149** (47 → 137 → 149), `-Wall -Wextra` **0 warning**.
+- `sizeof(Guard_ESP)` = **256 octets** (< 300, garanti par `static_assert`).
+- Aucune allocation dynamique dans `Guard_ESP.h` (hors commentaires).
+- `pio run` → **SUCCESS** sur `esp12e` et `esp32dev` pour les 2 exemples.
+- Bornes de compilation : `-DGE_BUCKETS=256`, `-DGE_ROUTES=128`,
+  `-DGE_SLOTS=32`, `-DGE_PRINT_BUF=4` → **échec de compilation** (voulu).
+- `Crash_ESP_Monitor` et `Server_MCP` : **non modifiés**.
+
+---
+
 ## 2026-10-22 — v1.0.0 (création)
 
 Première version. Noyau de protection + trois adaptateurs, extraits des

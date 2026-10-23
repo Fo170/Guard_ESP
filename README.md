@@ -4,10 +4,10 @@ Bibliothèque de **protection** pour **ESP8266** et **ESP32** : elle décide
 d'**admettre, ralentir ou rejeter** une requête **avant** que l'appareil n'ait
 consommé la moindre ressource fatale.
 
-> **Auteur** : Olivier FOURNET · **Licence** : GPL-3.0-only · **Version** : 1.0.0
+> **Auteur** : Olivier FOURNET · **Licence** : GPL-3.0-only · **Version** : 1.1.0
 > **Compatibilité** : ESP8266 (NodeMCU, Wemos D1) et ESP32 (DevKit, Wemos D1 Mini ESP32)
 > sous **Arduino IDE** et **PlatformIO**
-> **Header-only** · **zéro allocation dynamique** · `sizeof(Guard_ESP)` = **232 octets**
+> **Header-only** · **zéro allocation dynamique** · `sizeof(Guard_ESP)` = **256 octets**
 
 ---
 
@@ -21,9 +21,11 @@ consommé la moindre ressource fatale.
 | API | `CM_Statut()`, `CM_HeapOKBloc()` | `guard.admit()`, `guard.resume()` |
 | En cas de panne | rien n'est cassé | laisse passer **ou** bloque tout |
 
-Les deux sont **complémentaires et indépendantes**. `Guard_ESP` reste autonome ;
-s'il détecte `Crash_ESP_Monitor` (`__has_include`), il en réutilise la mesure
-mémoire. **`Crash_ESP_Monitor` n'est jamais modifié.**
+Les deux sont **complémentaires et indépendantes**. `Guard_ESP` est **totalement
+autonome** : il mesure la mémoire lui-même (`ESP.getFreeHeap()` /
+`heap_caps_get_free_size()`), sans dépendre de `Crash_ESP_Monitor` ni d'aucune
+autre bibliothèque. **`Crash_ESP_Monitor` n'est jamais modifié**, et aucun
+`__has_include` n'est utilisé.
 
 ---
 
@@ -41,7 +43,7 @@ Mesures réelles sur le parc — le contrôle de flux existant ne couvrait que
 | 5 IoT web sans aucune protection | **1 requête bloque le loop 10 s** |
 | 4 projets tournent avec les **défauts ESP32** (8 req/30 s) | inadapté à 15× moins de mémoire |
 
-Détail complet, taxonomie de **34 problèmes** et **12 bonnes pratiques** :
+Détail complet, taxonomie de **49 problèmes** (8 familles) et **12 bonnes pratiques** :
 [`LIVRE_BLANC.md`](LIVRE_BLANC.md).
 
 ---
@@ -79,7 +81,7 @@ void setup() {
 }
 
 void loop() {
-  guard.tick();                   // watchdog d'inactivité
+  guard.tick();                   // libère les slots d'un handler bloqué
 }
 ```
 
@@ -91,14 +93,21 @@ void loop() {
 GE_WebGuard<decltype(server)> wguard(guard);
 
 void maRoute() {
-  if (!wguard.admit(server, 2, 1200)) return;   // refus déjà envoyé (429/503)
-  // ... traitement ...
-  wguard.fin();
+  GE_Ticket t = wguard.admit(server, 2, 192);   // 192 = plus gros bloc alloué
+  if (!t) return;                               // refus déjà envoyé (429/503)
+  // ... traitement : le slot est libéré à la sortie de portée ...
 }
 ```
 
-Le refus envoie automatiquement `Retry-After`, `X-RateLimit-Limit`,
-`X-RateLimit-Used`, `X-RateLimit-Window` et `X-Guard-Reason`.
+⚠️ **Ne jamais écrire `if (!wguard.admit(...)) return;`** : le ticket serait
+détruit à la fin de l'instruction et le slot rendu **avant** le traitement.
+Toujours stocker le ticket dans une variable. `admit()` est marqué
+`warn_unused_result` pour que le compilateur signale l'erreur.
+
+Le refus envoie `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Used`,
+`X-RateLimit-Remaining`, `X-RateLimit-Window` et `X-Guard-Reason` — **sauf**
+si l'appareil est déjà sous pression mémoire, où aucun en-tête n'est
+construit (pas de `String` au pire moment).
 
 ### 3. MCP — délégation à `Server_MCP`
 
@@ -157,31 +166,44 @@ l'appelant, et retourne le nombre de caractères écrits.
 
 | Méthode | Rôle |
 |---|---|
-| `admit(poids, taille)` | `true` = la requête peut être traitée |
-| `sortir()` | rend le slot de concurrence, mesure la durée |
-| `tick()` | à appeler dans `loop()` : libère les slots bloqués |
+| `admit(poids, taille)` | `true` = slot acquis, à rendre par `sortir()` (usage mono-requête) |
+| `ticket(poids, taille)` | **recommandé** : jeton RAII, libération automatique et exacte |
+| `sortir()` / `sortir(idx)` | rend le slot du dernier `admit()` / un slot précis |
+| `tick()` | à appeler dans `loop()` : libère les slots restés ouverts trop longtemps |
 | `activite()` | signale une activité métier (anti-inactivité) |
 
-### Diagnostic
+### Diagnostic et lecture
 
 | Méthode | Rôle |
 |---|---|
-| `refus()` / `refusTexte()` | cause du dernier refus |
+| `refus()` / `refusTexte(r)` | cause du dernier refus |
 | `retryAfterMs()` | délai à annoncer au client |
-| `resume(buf, len)` | résumé texte **sans `String`** |
+| `resume(buf, len)` | résumé texte **sans `String`** (retour ≤ `len-1`), **mutant** |
 | `route(nom)` / `routeOk()` / `routeKo()` | compteurs par route |
+| `routes()` / `routesSaturees()` | table des routes, drapeau de saturation |
 | `admis()` / `rejetes()` / `rejets(cause)` | compteurs globaux |
 | `dureePire()` / `depassements()` | tenue des handlers |
-| `inactif()` / `inactiviteMs()` | watchdog |
+| `inactif()` / `inactiviteMs()` / `activite()` | watchdog d'inactivité |
+| `canaux()` / `poidsMax()` / `fenetreMs()` | réglage actif |
+| `maxSousPression()` | **poids** max sous pression (1–3), pas un seuil mémoire |
+| `heapXoff()` / `blocXoff()` | seuils mémoire du XOFF (octets) |
+| `heapRefus()` / `blocRefus()` | seuils de la garde de démarrage (octets) |
+| `chargeCourante()` / `creditRestant()` | charge de la fenêtre, crédit restant (**mutants**) |
+| `xoff()` / `actifs()` / `actif()` / `actif(bool)` | état courant |
+| `concurrence()` / `bodyMax()` / `dureeMaxMs()` | réglage actif |
+| `profilId()` / `profilTexte()` | profil appliqué |
+| `enPression()` / `gardePassee()` | tests mémoire |
+| `heapLibre()` / `blocLibre()` (static) | mesures brutes |
 
 ### Causes de refus
 
 `GE_REFUS_FLUX` · `GE_REFUS_POIDS` · `GE_REFUS_PRESSION` ·
 `GE_REFUS_CONCURRENCE` · `GE_REFUS_BODY` · `GE_REFUS_BACKOFF` ·
-`GE_REFUS_GARDE` · `GE_REFUS_DUREE`
+`GE_REFUS_GARDE` · `GE_REFUS_INACTIF`
 
-Codes HTTP : **429** pour `FLUX` / `POIDS` / `BACKOFF` (le client peut
-réessayer), **503** pour les autres (patienter).
+Codes HTTP : **429** pour `FLUX` / `BACKOFF` (le client peut réessayer plus
+tard), **503** pour les autres. `POIDS` est un refus **structurel** (l'outil est
+trop lourd pour l'état de flux) : réessayer ne changera rien, d'où 503.
 
 ---
 
@@ -203,7 +225,7 @@ réessayer), **503** pour les autres (patienter).
 
 | Paramètre | ESP8266 | ESP32 |
 |---|---|---|
-| Concurrence | 1 | 2–4 |
+| Concurrence | 1 | 3 |
 | Canaux / fenêtre | 4 / 30 s | 8 / 30 s |
 | XOFF heap / bloc | 4 200 / 1 800 | 25 000 / 12 000 |
 | Refus total | 3 000 / 1 200 | 20 000 / 10 000 |
@@ -225,8 +247,8 @@ g++ -std=c++17 -Wall -Wextra -I tests -I src tests/test_guard.cpp -o test_guard
 ./test_guard
 ```
 
-**47 vérifications**, chacune référençant le problème réel qu'elle protège.
-Empreinte vérifiée : `sizeof(Guard_ESP) = 232 octets`.
+**149 vérifications**, chacune référençant le problème réel qu'elle protège.
+Empreinte vérifiée : `sizeof(Guard_ESP) = 256 octets` (garanti par `static_assert`).
 
 Compilation croisée des exemples :
 
@@ -241,6 +263,9 @@ cd examples/02_mcp_basic && pio run -e esp12e && pio run -e esp32dev
 
 - **Ne protège pas ce qui précède le handler** — décodage HTTP, TLS, parsing
   JSON d'entrée. La protection commence à l'entrée du handler.
+- **Les accesseurs mutants** (`resume`, `chargeCourante`, `creditRestant`)
+  font vieillir la fenêtre : les réserver à la tâche propriétaire du garde.
+- **`route(nom)`** exige une chaîne de durée de vie ≥ celle du programme.
 - **Ne remplace pas** `Server_MCP`, `ESP8266WebServer` ni `WebServer`.
 - **Ne répare pas un bug applicatif** (capteur muet, publication figée).
 - **N'empêche pas un crash matériel** (alimentation, capteur, RF).
@@ -258,5 +283,7 @@ cd examples/02_mcp_basic && pio run -e esp12e && pio run -e esp32dev
 | `src/Guard_ESP_print.h` | `Print` streamé sans `String` |
 | `examples/01_web_basic` | web + page streamée |
 | `examples/02_mcp_basic` | intégration `Server_MCP` |
-| `tests/` | 47 vérifications hôte + shim Arduino |
+| `tests/` | 149 vérifications hôte + shim Arduino (dont faux serveurs web) |
 | `LIVRE_BLANC.md` | taxonomie, bonnes pratiques, valeurs typiques |
+| `analyse.md` / `criteres.md` | cycle de chasse aux bugs n°1 |
+| `AGENTS.md` | invariants à ne pas casser, pièges connus |

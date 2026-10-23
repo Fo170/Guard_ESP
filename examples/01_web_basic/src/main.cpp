@@ -1,11 +1,12 @@
 // ════════════════════════════════════════════════════════════════
-// Exemple 1 — Guard_ESP + web + MCP (usage complet)
+// Exemple 1 — Guard_ESP + web + page streamée
 //
 // Montre les 3 points d'intégration :
 //   1. profil + auto-calibration au démarrage
 //   2. filtre de TOUTES les routes web (y compris `/`, angle mort
 //      du contrôle de flux MCP)
-//   3. délégation des valeurs de flux à Server_MCP (pas de duplication)
+//   3. page streamée : la taille à déclarer est celle du PLUS GROS
+//      BLOC alloué (192 o ici), pas la taille totale du corps
 // ════════════════════════════════════════════════════════════════
 #include <Arduino.h>
 #include <Guard_ESP.h>
@@ -24,8 +25,12 @@ Guard_ESP guard;
 GE_WebGuard<decltype(server)> wguard(guard);
 
 static void pageAccueil() {
-  // Filtre AVANT tout traitement : poids 2 (page moyenne), 1 200 o estimés.
-  if (!wguard.admit(server, 2, 1200)) return;
+  // Filtre AVANT tout traitement. `taille` = plus gros bloc alloué pour
+  // servir la requête (GE_ServerPrint utilise 192 o), PAS le corps entier :
+  // déclarer 1 200 o ferait refuser la page en BODY sur un ESP8266 à 4,7 Ko
+  // (part du heap = 25 % de 4 700 = 1 175 o).
+  GE_Ticket t = wguard.admit(server, 2, GE_PRINT_BUF);
+  if (!t) { guard.route("/"); guard.routeKo(); return; }
 
   // Réponse streamée : aucune String, buffer fixe de 192 o.
   GE_WebPrint out(server);
@@ -42,11 +47,12 @@ static void pageAccueil() {
 
   guard.route("/");
   guard.routeOk();
-  wguard.fin();
+  // Le ticket libère le slot automatiquement en sortant de portée.
 }
 
 static void apiEtat() {
-  if (!wguard.admit(server, 1, 600)) { guard.route("/api/etat"); guard.routeKo(); return; }
+  GE_Ticket t = wguard.admit(server, 1, GE_PRINT_BUF);
+  if (!t) { guard.route("/api/etat"); guard.routeKo(); return; }
 
   char buf[320];
   guard.resume(buf, sizeof(buf));
@@ -54,7 +60,6 @@ static void apiEtat() {
 
   guard.route("/api/etat");
   guard.routeOk();
-  wguard.fin();
 }
 
 void setup() {
@@ -63,6 +68,7 @@ void setup() {
 
   guard.profil(GE_PROFIL_AUTO);   // ESP8266 → 4/30 s, ESP32 → 8/30 s
   guard.autoCalibrer();           // dérive les seuils de H_ref mesuré
+  // ⚠️ setGarde() doit venir APRÈS autoCalibrer(), qui écrase la garde.
   guard.setGarde(3000, 1200);     // refus de servir si la marge manque
   guard.demarrer();
 
@@ -77,5 +83,5 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  guard.tick();   // watchdog d'inactivité + libération des slots bloqués
+  guard.tick();   // libère les slots d'un handler resté bloqué
 }

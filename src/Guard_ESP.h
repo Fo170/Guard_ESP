@@ -14,11 +14,18 @@
 //   6. Tempête de retries      → backoff + cooldown après reboot
 //   7. Démarrage en RAM faible → garde H_ref (refus de servir)
 //
-// ⚠️ Contraintes de conception (ne pas régresser) :
-//   - aucune allocation dynamique : ni malloc, ni new, ni String
-//   - tableaux fixes uniquement (dimensionnés par GE_BUCKETS / GE_ROUTES)
+// ⚠️ CONTRAINTES DE CONCEPTION (ne pas régresser)
+//   - aucune allocation dynamique dans CE fichier : ni malloc, ni new, ni String
+//   - tableaux fixes uniquement (GE_BUCKETS / GE_ROUTES / GE_SLOTS)
 //   - admit() répond en O(1), ne bloque jamais, n'appelle jamais delay()
-//   - réentrant : appelable depuis loop() et depuis un handler web
+//
+// ⚠️ THREAD-SAFETY
+//   Les MUTATIONS d'état (admitInterne, sortir, tick, route*, viderFenetre)
+//   sont protégées par un verrou critique (portMUX sur ESP32, sans objet sur
+//   ESP8266 mono-cœur). Les ACCESSEURS DE LECTURE ne sont pas verrouillés :
+//   ne pas les appeler depuis une autre tâche en croyant obtenir une vue
+//   atomique. Les accesseurs MUTANTS (chargeCourante, creditRestant, resume)
+//   font vieillir la fenêtre : les réserver à la tâche propriétaire.
 //
 // Auteur : Olivier FOURNET · Licence : GPL-3.0-only
 // ════════════════════════════════════════════════════════════════
@@ -30,17 +37,39 @@
 #include <string.h>
 #include <stdio.h>
 
-#define GE_VERSION "1.0.0"
+#define GE_VERSION "1.1.0"
+
+// Signale à l'appelant qu'ignorer le résultat d'admit() est un bug :
+// un ticket détruit immédiatement rend le slot AVANT le traitement.
+#if defined(__GNUC__)
+  #define GE_NODISCARD __attribute__((warn_unused_result))
+#else
+  #define GE_NODISCARD
+#endif
 
 // ────────────────────────────────────────────────────────────────
 // DIMENSIONNEMENT (compile-time, surchargeable par -D)
 // ────────────────────────────────────────────────────────────────
 #ifndef GE_BUCKETS
-#define GE_BUCKETS 8      // seaux de la fenêtre glissante (1 seau = fenêtre/8)
+#define GE_BUCKETS 8      // seaux PLEINS de la fenêtre (1 seau = fenêtre/GE_BUCKETS)
 #endif
 #ifndef GE_ROUTES
-#define GE_ROUTES 4       // nb de routes suivies par les compteurs (0 = désactivé)
+#define GE_ROUTES 4       // routes suivies par les compteurs (0 = désactivé)
 #endif
+#ifndef GE_SLOTS
+#define GE_SLOTS 4        // requêtes simultanées possibles (borne haute de concurrence)
+#endif
+#ifndef GE_ROUTE_NOM_MAX
+#define GE_ROUTE_NOM_MAX 0   // 0 = pointeur (littéral) ; >0 = copie du nom (coût RAM)
+#endif
+
+// Bornes hautes : sans elles, un `for (uint8_t i…)` boucle à l'infini et un
+// `int8_t` d'index devient négatif. Vérifié : GE_BUCKETS=256 bloquait demarrer().
+static_assert(GE_BUCKETS >= 2 && GE_BUCKETS <= 64, "GE_BUCKETS doit etre dans [2,64]");
+static_assert(GE_ROUTES <= 64,                      "GE_ROUTES doit etre <= 64");
+static_assert(GE_SLOTS >= 1 && GE_SLOTS <= 13,      "GE_SLOTS doit etre dans [1,13]");
+static_assert(GE_ROUTE_NOM_MAX == 0 || GE_ROUTE_NOM_MAX >= 4,
+              "GE_ROUTE_NOM_MAX doit valoir 0 ou >= 4");
 
 // ────────────────────────────────────────────────────────────────
 // DÉFAUTS GÉNÉRIQUES (écrasés par un profil)
@@ -69,9 +98,9 @@
 // pas un simple jeu de constantes.
 // ────────────────────────────────────────────────────────────────
 enum GE_ProfilId : uint8_t {
-  GE_PROFIL_AUTO   = 0,   // déduit de la plateforme de compilation
-  GE_PROFIL_ESP8266 = 1,  // ressource rare, concurrence interdite
-  GE_PROFIL_ESP32   = 2   // ressource abondante, concurrence autorisée
+  GE_PROFIL_AUTO    = 0,   // déduit de la plateforme de compilation
+  GE_PROFIL_ESP8266 = 1,   // ressource rare, concurrence interdite
+  GE_PROFIL_ESP32   = 2    // ressource abondante, concurrence autorisée
 };
 
 // ────────────────────────────────────────────────────────────────
@@ -85,14 +114,64 @@ enum GE_Refus : uint8_t {
   GE_REFUS_CONCURRENCE,   // trop de requêtes simultanées
   GE_REFUS_BODY,          // taille estimée trop grande pour la mémoire
   GE_REFUS_BACKOFF,       // en cooldown après erreur
-  GE_REFUS_GARDE,         // appareil pas encore prêt (H_ref insuffisant)
-  GE_REFUS_DUREE          // requête précédente trop longue
+  GE_REFUS_GARDE          // appareil pas encore prêt (H_ref insuffisant)
 };
 
 struct GE_RouteStat {
   const char* nom;
   uint32_t ok;
   uint32_t ko;
+};
+
+class Guard_ESP;
+
+// ────────────────────────────────────────────────────────────────
+// Verrou critique : protège les mutations d'état du noyau.
+// ESP8266 = mono-cœur, aucun parallélisme sur ces appels → sans objet.
+// ESP32   = deux cœurs + tâche async_tcp → portMUX indispensable.
+// ────────────────────────────────────────────────────────────────
+#if defined(ESP32)
+  #define GE_VERROU(m)   portENTER_CRITICAL(m)
+  #define GE_DEVERROU(m) portEXIT_CRITICAL(m)
+#else
+  #define GE_VERROU(m)
+  #define GE_DEVERROU(m)
+#endif
+
+// ════════════════════════════════════════════════════════════════
+// TICKET — jeton RAII d'une requête admise
+// Remplace l'ancien couple admit()/fin() des adaptateurs, qui stockait
+// l'état « ouvert » dans un booléen PAR INSTANCE : deux requêtes
+// simultanées écrasaient ce booléen et un slot de concurrence était
+// perdu définitivement (mesuré : actifs=1 après 2 admits + 2 fins).
+// Un ticket porte SON index de slot : la libération est exacte.
+// ════════════════════════════════════════════════════════════════
+class GE_Ticket {
+public:
+  GE_Ticket() : _g(nullptr), _idx(GE_SLOT_AUCUN) {}
+  GE_Ticket(Guard_ESP& g, bool ok, uint8_t idx)
+    : _g(ok ? &g : nullptr), _idx(ok ? idx : GE_SLOT_AUCUN) {}
+
+  ~GE_Ticket() { liberer(); }
+
+  GE_Ticket(GE_Ticket&& o) noexcept : _g(o._g), _idx(o._idx) {
+    o._g = nullptr; o._idx = GE_SLOT_AUCUN;
+  }
+  GE_Ticket& operator=(GE_Ticket&& o) noexcept {
+    if (this != &o) { liberer(); _g = o._g; _idx = o._idx; o._g = nullptr; o._idx = GE_SLOT_AUCUN; }
+    return *this;
+  }
+  GE_Ticket(const GE_Ticket&) = delete;
+  GE_Ticket& operator=(const GE_Ticket&) = delete;
+
+  explicit operator bool() const { return _idx != GE_SLOT_AUCUN; }
+  bool ok() const { return _idx != GE_SLOT_AUCUN; }
+
+private:
+  static const uint8_t GE_SLOT_AUCUN = 0xFF;
+  void liberer();
+  Guard_ESP* _g;
+  uint8_t    _idx;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -113,79 +192,114 @@ public:
     }
     _profil = p;
     if (p == GE_PROFIL_ESP8266) {
-      regler(4, 30000UL, 3, 1, 1, 800UL, 2048UL,
+      regler(4, 30000UL, 3, 1, borneConcurrence(1), 800UL, 2048UL,
              4200UL, 1800UL, 3000UL, 1200UL, 25);
     } else {
-      regler(8, 30000UL, 3, 3, 3, 2500UL, 8192UL,
+      regler(8, 30000UL, 3, 3, borneConcurrence(3), 2500UL, 8192UL,
              25000UL, 12000UL, 20000UL, 10000UL, 10);
     }
+    // Le profil ARME la garde de démarrage avec les seuils « refus total ».
+    // Sans cela, _heapRefus/_blocRefus étaient écrits mais jamais lus
+    // (finding W10) et la garde restait inactive par défaut.
+    setGarde(_heapRefus, _blocRefus);
     _actif = true;
   }
 
-  void regler(uint16_t canaux, uint32_t fenetreMs, uint16_t poidsMax,
+  // Retourne false si un paramètre est hors bornes : la configuration
+  // précédente est alors CONSERVÉE (aucune écriture partielle).
+  bool regler(uint16_t canaux, uint32_t fenetreMs, uint16_t poidsMax,
               uint16_t sousPression, uint8_t concurrence, uint32_t dureeMaxMs,
               uint32_t bodyMax, uint32_t heapXoff, uint32_t blocXoff,
               uint32_t heapRefus, uint32_t blocRefus, uint8_t partHeap) {
-    _canaux          = canaux ? canaux : 1;
-    _fenetreMs       = fenetreMs ? fenetreMs : GE_FENETRE_DEF;
-    _poidsMax        = poidsMax ? poidsMax : 1;
-    _sousPression    = sousPression ? sousPression : 1;
-    _concurrence     = concurrence ? concurrence : 1;
+    if (canaux == 0 || canaux > 4096)                 return false;
+    if (fenetreMs < 1000UL || fenetreMs > 3600000UL)  return false;
+    if (poidsMax == 0)                                return false;
+    if (sousPression == 0)                            return false;
+    if (concurrence == 0 || concurrence > GE_SLOTS)   return false;
+    if (dureeMaxMs > 600000UL)                        return false;   // borne anti-débordement (×4)
+    if (bodyMax == 0)                                 return false;
+    if (partHeap == 0 || partHeap > 100)              return false;
+    if (heapRefus > heapXoff)                         return false;
+    if (blocRefus > blocXoff)                         return false;
+
+    _canaux          = canaux;
+    _fenetreMs       = fenetreMs;
+    _poidsMax        = poidsMax;
+    _sousPression    = sousPression;
+    _concurrence     = concurrence;
     _dureeMaxMs      = dureeMaxMs;
     _bodyMax         = bodyMax;
     _heapXoff        = heapXoff;
     _blocXoff        = blocXoff;
     _heapRefus       = heapRefus;
     _blocRefus       = blocRefus;
-    _partHeap        = partHeap ? partHeap : 10;
+    _partHeap        = partHeap;
     _bucketMs        = _fenetreMs / GE_BUCKETS;
     if (_bucketMs == 0) _bucketMs = 1;
+    // La granularité change : les comptes acquis avec l'ancienne doivent
+    // être purgés, sinon le quota effectif devient incohérent (S2).
+    GE_VERROU(&_mux);
+    viderFenetre(millis());
+    GE_DEVERROU(&_mux);
+    return true;
   }
 
   // Garde de démarrage : refus de servir tant que la marge n'est pas là.
   // Un seuil doit rester SOUS le régime normal, sinon XOFF permanent
   // (incident Telegram 01/09/2026 : garde à 35 Ko au lieu de 30).
   void setGarde(uint32_t heapMin, uint32_t blocMin) {
-    _gardeHeap = heapMin;
-    _gardeBloc = blocMin;
+    _gardeHeap   = heapMin;
+    _gardeBloc   = blocMin;
     _gardeActive = (heapMin || blocMin);
   }
 
   void setBackoff(uint32_t baseMs, uint32_t maxMs) {
-    _backoffBase = baseMs ? baseMs : 1;
-    _backoffMax  = maxMs ? maxMs : _backoffBase;
-    _backoffCur  = _backoffBase;
+    if (baseMs == 0) baseMs = 1;
+    if (maxMs < baseMs) maxMs = baseMs;
+    _backoffBase = baseMs;
+    _backoffMax  = maxMs;
+    _backoffCur  = baseMs;
   }
 
   void setInactivite(uint32_t seuilMs) { _inactSeuil = seuilMs; }
 
   // Auto-calibration depuis H_ref (heap après init WiFi + services).
-  //   XOFF      = H_ref × 0.75
-  //   refus     = H_ref × 0.55
-  //   bloc mini = H_ref × 0.35
-  //   canaux    = H_ref > 20000 ? 8 : (H_ref > 10000 ? 6 : 4)
+  // Formules (identiques au LIVRE_BLANC §3.5) :
+  //   heapXoff   = 0,75 × H_ref      blocXoff = 0,35 × H_ref
+  //   gardeHeap  = 0,55 × H_ref      gardeBloc = 0,25 × H_ref
+  //   canaux     = H_ref > 20000 ? 8 : (H_ref > 10000 ? 6 : 4)
+  //   concurrence= H_ref > 20000 ? 3 : 1
+  // ⚠️ Écrase la configuration courante : appeler AVANT setGarde().
   void autoCalibrer() {
     uint32_t href = heapLibre();
-    if (href < 1000) href = 1000;
-    uint32_t xoff  = (href * 75) / 100;
-    uint32_t refus = (href * 55) / 100;
-    uint32_t bloc  = (href * 35) / 100;
+    if (href < 1000UL) href = 1000UL;
+    uint32_t heapXoff  = (href * 75UL) / 100UL;
+    uint32_t blocXoff  = (href * 35UL) / 100UL;
+    uint32_t gardeHeap = (href * 55UL) / 100UL;
+    uint32_t gardeBloc = (href * 25UL) / 100UL;
     uint16_t can   = (href > 20000UL) ? 8 : ((href > 10000UL) ? 6 : 4);
-    uint8_t  conc  = (href > 20000UL) ? 3 : 1;
-    setGarde(refus, (bloc * 2) / 5);
-    regler(can, GE_FENETRE_DEF, 3, (conc > 1 ? 3 : 1), conc,
-           _dureeMaxMs, _bodyMax, xoff, bloc, refus, (bloc * 2) / 5, _partHeap);
+    uint8_t  conc  = borneConcurrence((href > 20000UL) ? 3 : 1);
+    uint16_t sousP = (conc > 1) ? 3 : 1;
+    // regler() peut refuser (paramètre hors bornes) : on n'arme alors PAS la
+    // garde, sinon elle serait incohérente avec un XOFF non appliqué — c'est
+    // exactement le motif de l'incident du 01/09 (garde > XOFF).
+    if (regler(can, GE_FENETRE_DEF, 3, sousP, conc,
+               _dureeMaxMs, _bodyMax, heapXoff, blocXoff, gardeHeap, gardeBloc, _partHeap)) {
+      setGarde(gardeHeap, gardeBloc);
+    }
   }
 
+  // Arme le cooldown post-reboot et remet la fenêtre à zéro.
   void demarrer() {
+    GE_VERROU(&_mux);
     _derniereActivite = millis();
     _cooldownFin = _derniereActivite + GE_COOLDOWN_REBOOT_DEF;
-    _winStart = 0;
-    for (uint8_t i = 0; i < GE_BUCKETS; i++) _bucket[i] = 0;
-    _idx = 0;
+    viderFenetre(_derniereActivite);
+    _refus = GE_REFUS_AUCUN;
+    GE_DEVERROU(&_mux);
   }
 
-  // ── Mesure mémoire (déléguée à Crash_ESP_Monitor si présent) ──
+  // ── Mesure mémoire (hors verrou : ne pas couper les interruptions) ──
   static uint32_t heapLibre() {
 #if defined(ESP8266)
     return (uint32_t)ESP.getFreeHeap();
@@ -202,9 +316,11 @@ public:
 #endif
   }
 
-  bool enPression() const {
-    return (heapLibre() < _heapXoff) || (blocLibre() < _blocXoff);
+  static bool enPression(uint32_t heap, uint32_t bloc, uint32_t seuilHeap, uint32_t seuilBloc) {
+    return (heap < seuilHeap) || (bloc < seuilBloc);
   }
+
+  bool enPression() const { return enPression(heapLibre(), blocLibre(), _heapXoff, _blocXoff); }
 
   bool gardePassee() const {
     if (!_gardeActive) return true;
@@ -212,85 +328,102 @@ public:
   }
 
   // ── Décision principale ───────────────────────────────────────
-  // poids  : coût de la requête (1 léger … 3 lourd)
-  // taille : taille estimée de la réponse en octets (0 = inconnue)
-  // Retourne true = la requête peut être traitée.
-  bool admit(uint8_t poids = 1, uint32_t taille = 0) {
-    if (!_actif) { _admis++; return true; }
-    if (poids == 0) poids = 1;
-    uint32_t now = millis();
-
-    // 1. Cooldown post-reboot / post-erreur
-    if (_cooldownFin && (int32_t)(now - _cooldownFin) < 0) {
-      return refuser(GE_REFUS_BACKOFF);
+  // poids  : coût de la requête (1 léger … _poidsMax lourd)
+  // taille : taille du PLUS GROS BLOC alloué pour servir la requête
+  //          (pas la taille totale du corps : une réponse streamée par
+  //          blocs de 192 o passe avec taille = 192)
+  // Retourne true = slot acquis, à rendre par sortir().
+  // ⚠️ Le résultat ne doit pas être ignoré : utiliser un GE_Ticket.
+  GE_NODISCARD bool admit(uint8_t poids = 1, uint32_t taille = 0) {
+    uint8_t idx = GE_SLOT_AUCUN;
+    bool ok = admitInterne(poids, taille, idx);
+    if (ok) {
+      GE_VERROU(&_mux);
+      _slotDernier = idx;
+      GE_DEVERROU(&_mux);
     }
-
-    // 2. Garde de démarrage
-    if (!gardePassee()) return refuser(GE_REFUS_GARDE);
-
-    // 3. Pression mémoire (XON/XOFF)
-    bool xoff = enPression();
-    uint16_t maxEff = xoff ? _sousPression : _canaux;
-
-    // 4. Outil structurellement trop lourd pour l'état de flux
-    //    (message distinct du « saturé » : sinon diagnostic trompeur,
-    //     cf. Server_MCP v1.3.1 « canaux 0/2 »)
-    if (poids > maxEff) {
-      _xoff = xoff;
-      return refuser(xoff ? GE_REFUS_PRESSION : GE_REFUS_POIDS);
-    }
-
-    // 5. Concurrence
-    if (_actifs >= _concurrence) return refuser(GE_REFUS_CONCURRENCE);
-
-    // 6. Taille de réponse : plafond absolu puis part du heap
-    if (taille) {
-      if (taille > _bodyMax) return refuser(GE_REFUS_BODY);
-      uint32_t part = (heapLibre() * _partHeap) / 100;
-      if (taille > part) return refuser(GE_REFUS_BODY);
-    }
-
-    // 7. Fenêtre glissante pondérée
-    avancer(now);
-    if ((uint32_t)(charge() + poids) > maxEff) {
-      _xoff = xoff;
-      return refuser(GE_REFUS_FLUX);
-    }
-
-    // Admis
-    _bucket[_idx] = (uint16_t)(_bucket[_idx] + poids);
-    _actifs++;
-    _reqStart = now;
-    _admis++;
-    _xoff = xoff;
-    _derniereActivite = now;
-    _refus = GE_REFUS_AUCUN;
-    return true;
+    return ok;
   }
 
-  // Libère le slot de concurrence et mesure la durée réelle.
+  // Variante ticket : libération automatique et exacte (RAII).
+  // ⚠️ Le ticket doit être conservé dans une variable de portée handler.
+  GE_NODISCARD GE_Ticket ticket(uint8_t poids = 1, uint32_t taille = 0) {
+    uint8_t idx = GE_SLOT_AUCUN;
+    bool ok = admitInterne(poids, taille, idx);
+    if (ok) {
+      GE_VERROU(&_mux);
+      _slotDernier = idx;
+      GE_DEVERROU(&_mux);
+    }
+    return GE_Ticket(*this, ok, idx);
+  }
+
+  // Rend le slot acquis par le dernier admit() (usage MONO-REQUÊTE).
+  // Avec _concurrence > 1, préférer le GE_Ticket : _slotDernier ne désigne
+  // que le dernier slot ouvert.
   void sortir() {
+    uint8_t idx;
+    GE_VERROU(&_mux);
+    idx = _slotDernier;
+    GE_DEVERROU(&_mux);
+    sortir(idx);
+  }
+
+  // Rend un slot précis (usage concurrent / GE_Ticket).
+  void sortir(uint8_t idx) {
+    GE_VERROU(&_mux);
+    // sortir() sans admit(), ou slot déjà rendu par tick() : ne rien mesurer.
+    if (idx >= GE_SLOTS || !_slotBusy[idx]) {
+      GE_DEVERROU(&_mux);
+      return;
+    }
+    bool fictif = _slotFictif[idx];
+    _slotBusy[idx]    = false;
+    _slotFictif[idx]  = false;
     if (_actifs) _actifs--;
-    uint32_t d = millis() - _reqStart;
+    GE_DEVERROU(&_mux);
+
+    // Slot fictif (protection désactivée) : aucun temps à mesurer, sinon
+    // la durée serait aberrante (finding C4 : dureePire = 105 000 ms).
+    if (fictif) return;
+
+    uint32_t d = millis() - _slotStart[idx];
     if (d > _dureePire) _dureePire = d;
     if (_dureeMaxMs && d > _dureeMaxMs) {
       _depassements++;
       _cooldownFin = millis() + _backoffCur;
-      _backoffCur = (_backoffCur * 2 > _backoffMax) ? _backoffMax : _backoffCur * 2;
+      uint32_t suivant = _backoffCur * 2UL;
+      if (suivant < _backoffCur) suivant = _backoffMax;      // anti-débordement
+      _backoffCur = (suivant > _backoffMax) ? _backoffMax : suivant;
     } else {
       _backoffCur = _backoffBase;
     }
   }
 
-  // ── Watchdog d'inactivité ─────────────────────────────────────
-  // Comble un angle mort réel : une poussée Domoticz arrêtée 9 h 34
-  // sans que rien ne le signale (Coulometre F-19).
+  // ── Watchdog de concurrence ───────────────────────────────────
+  // Libère les slots restés ouverts anormalement longtemps (handler qui
+  // n'a jamais rendu la main). Les slots sont marqués libres, donc le
+  // sortir() ultérieur ne recompte pas (finding W3), et _actifs est
+  // DÉCRÉMENTÉ par slot réellement libéré — le remettre à 0 laissait
+  // passer plus de requêtes que _concurrence (finding 30).
   void tick() {
+    if (_dureeMaxMs == 0) return;
+    uint32_t limite = _dureeMaxMs * 4UL;
     uint32_t now = millis();
-    if (_actifs && _dureeMaxMs && (uint32_t)(now - _reqStart) > _dureeMaxMs * 4) {
-      _actifs = 0;
+    uint8_t liberes = 0;
+    GE_VERROU(&_mux);
+    for (uint8_t i = 0; i < GE_SLOTS; i++) {
+      if (_slotBusy[i] && (uint32_t)(now - _slotStart[i]) > limite) {
+        _slotBusy[i]   = false;
+        _slotFictif[i] = false;
+        liberes++;
+      }
+    }
+    if (liberes) {
+      _actifs = (_actifs > liberes) ? (uint8_t)(_actifs - liberes) : 0;
       _depassements++;
     }
+    GE_DEVERROU(&_mux);
   }
 
   void activite() { _derniereActivite = millis(); }
@@ -300,20 +433,35 @@ public:
   bool inactif() const { return _inactSeuil && (inactiviteMs() > _inactSeuil); }
 
   // ── Compteurs par route ───────────────────────────────────────
+  // ⚠️ `nom` doit désigner une chaîne de durée de vie >= celle du programme
+  // (littéral ou buffer statique). La comparaison se fait PAR CHAÎNE : deux
+  // littéraux distincts de même contenu désignent la même route.
   void route(const char* nom) {
 #if GE_ROUTES > 0
-    _routeCur = -1;
+    GE_VERROU(&_mux);
+    if (!nom) { _routeCur = -1; GE_DEVERROU(&_mux); return; }
     for (uint8_t i = 0; i < GE_ROUTES; i++) {
-      if (_routes[i].nom == nom || (_routes[i].nom && nom && strcmp(_routes[i].nom, nom) == 0)) {
+      if (!_routes[i].nom) {
+#if GE_ROUTE_NOM_MAX > 0
+        strncpy(_routeNoms[i], nom, GE_ROUTE_NOM_MAX - 1);
+        _routeNoms[i][GE_ROUTE_NOM_MAX - 1] = '\0';
+        _routes[i].nom = _routeNoms[i];
+#else
+        _routes[i].nom = nom;
+#endif
         _routeCur = (int8_t)i;
+        GE_DEVERROU(&_mux);
         return;
       }
-      if (!_routes[i].nom) {
-        _routes[i].nom = nom;
+      if (strcmp(_routes[i].nom, nom) == 0) {
         _routeCur = (int8_t)i;
+        GE_DEVERROU(&_mux);
         return;
       }
     }
+    _routeCur = -1;
+    _routesSaturees = true;     // table pleine : signalé, plus silencieux
+    GE_DEVERROU(&_mux);
 #else
     (void)nom;
 #endif
@@ -321,17 +469,22 @@ public:
 
   void routeOk() {
 #if GE_ROUTES > 0
+    GE_VERROU(&_mux);
     if (_routeCur >= 0) _routes[(uint8_t)_routeCur].ok++;
+    GE_DEVERROU(&_mux);
 #endif
   }
 
   void routeKo() {
 #if GE_ROUTES > 0
+    GE_VERROU(&_mux);
     if (_routeCur >= 0) _routes[(uint8_t)_routeCur].ko++;
+    GE_DEVERROU(&_mux);
 #endif
   }
 
   const GE_RouteStat* routes() const { return _routes; }
+  bool routesSaturees() const { return _routesSaturees; }
 
   // ── Accès / diagnostic ────────────────────────────────────────
   GE_Refus refus() const { return _refus; }
@@ -345,24 +498,47 @@ public:
       case GE_REFUS_BODY:         return "body";
       case GE_REFUS_BACKOFF:      return "backoff";
       case GE_REFUS_GARDE:        return "garde";
-      case GE_REFUS_DUREE:        return "duree";
       default:                    return "aucun";
     }
   }
 
   // Délai à annoncer au client (en-tête Retry-After, en secondes).
+  // Un événement reste compté jusqu'à GE_RING × _bucketMs (anneau de
+  // GE_BUCKETS+1 seaux) : annoncer la fenêtre seule ferait refuser une
+  // seconde fois le client qui respecte l'en-tête (finding 39).
   uint32_t retryAfterMs() const {
     if (_refus == GE_REFUS_BACKOFF) {
       uint32_t now = millis();
-      return ((int32_t)(_cooldownFin - now) > 0) ? (_cooldownFin - now) : 1000;
+      return ((int32_t)(_cooldownFin - now) > 0) ? (_cooldownFin - now) : 1000UL;
     }
-    return _fenetreMs;
+    if (_refus == GE_REFUS_CONCURRENCE) return 1000UL;   // un slot se libère vite
+    return (uint32_t)GE_RING * _bucketMs;
   }
 
   uint16_t canaux() const { return _canaux; }
+  uint16_t poidsMax() const { return _poidsMax; }
   uint32_t fenetreMs() const { return _fenetreMs; }
   uint16_t maxSousPression() const { return _sousPression; }
-  uint16_t chargeCourante() { avancer(millis()); return charge(); }
+
+  // Accesseurs MUTANTS : ils font vieillir la fenêtre. À réserver à la
+  // tâche propriétaire du garde (ne pas appeler depuis un autre cœur).
+  uint16_t chargeCourante() {
+    GE_VERROU(&_mux);
+    avancer(millis());
+    uint16_t c = charge();
+    GE_DEVERROU(&_mux);
+    return c;
+  }
+
+  uint16_t creditRestant() {
+    GE_VERROU(&_mux);
+    avancer(millis());
+    uint16_t maxEff = _xoff ? _sousPression : _canaux;
+    uint16_t c = charge();
+    GE_DEVERROU(&_mux);
+    return (c >= maxEff) ? 0 : (uint16_t)(maxEff - c);
+  }
+
   bool xoff() const { return _xoff; }
   bool actif() const { return _actif; }
   void actif(bool v) { _actif = v; }
@@ -370,6 +546,10 @@ public:
   uint8_t concurrence() const { return _concurrence; }
   uint32_t bodyMax() const { return _bodyMax; }
   uint32_t dureeMaxMs() const { return _dureeMaxMs; }
+  uint32_t heapXoff() const { return _heapXoff; }
+  uint32_t blocXoff() const { return _blocXoff; }
+  uint32_t heapRefus() const { return _heapRefus; }
+  uint32_t blocRefus() const { return _blocRefus; }
   GE_ProfilId profilId() const { return _profil; }
 
   const char* profilTexte() const {
@@ -387,24 +567,34 @@ public:
       case GE_REFUS_BODY:        return _rejBody;
       case GE_REFUS_BACKOFF:     return _rejBackoff;
       case GE_REFUS_GARDE:       return _rejGarde;
-      case GE_REFUS_DUREE:       return _rejDuree;
       default:                   return 0;
     }
   }
   uint32_t dureePire() const { return _dureePire; }
   uint32_t depassements() const { return _depassements; }
 
-  // Résumé texte SANS String (écrit dans un buffer appelant).
-  // Retourne le nombre de caractères écrits (hors NUL).
-  size_t resume(char* buf, size_t len) const {
-    if (!buf || !len) return 0;
+  // Résumé texte SANS String. Retourne le nombre de caractères RÉELLEMENT
+  // écrits (hors NUL), donc <= len-1.
+  // MUTANT : fait vieillir la fenêtre pour afficher la charge réelle
+  // (sinon « charge 4/4 » restait affiché après 10 min d'inactivité).
+  size_t resume(char* buf, size_t len) {
+    if (!buf || len < 2) return 0;
+    uint16_t ch;
+    uint16_t maxEff;
+    GE_VERROU(&_mux);
+    avancer(millis());
+    ch = charge();
+    maxEff = _xoff ? _sousPression : _canaux;
+    GE_DEVERROU(&_mux);
+
     int n = snprintf(buf, len,
                      "Guard_ESP %s | profil %s %u/%lus | charge %u/%u%s | actifs %u/%u"
-                     " | admis %lu rejets %lu (flux %lu poids %lu pression %lu conc %lu body %lu backoff %lu garde %lu)"
+                     " | admis %lu rejets %lu (flux %lu poids %lu pression %lu conc %lu"
+                     " body %lu backoff %lu garde %lu)"
                      " | heap %lu bloc %lu | duree pire %lums depass %lu",
                      GE_VERSION, profilTexte(),
-                     (unsigned)_canaux, (unsigned long)(_fenetreMs / 1000),
-                     (unsigned)_bucket[_idx], (unsigned)(_xoff ? _sousPression : _canaux),
+                     (unsigned)_canaux, (unsigned long)(_fenetreMs / 1000UL),
+                     (unsigned)ch, (unsigned)maxEff,
                      _xoff ? " XOFF" : "",
                      (unsigned)_actifs, (unsigned)_concurrence,
                      (unsigned long)_admis, (unsigned long)_rejetes,
@@ -414,33 +604,120 @@ public:
                      (unsigned long)_rejGarde,
                      (unsigned long)heapLibre(), (unsigned long)blocLibre(),
                      (unsigned long)_dureePire, (unsigned long)_depassements);
-    return (n > 0) ? (size_t)n : 0;
+    if (n < 0) { buf[0] = '\0'; return 0; }
+    return ((size_t)n < len) ? (size_t)n : (len - 1);
   }
 
 private:
-  // ── Fenêtre glissante par seaux (O(1), sans allocation) ───────
-  void avancer(uint32_t now) {
-    if (_winStart == 0) { _winStart = now; return; }
-    uint8_t garde = GE_BUCKETS;
-    while ((uint32_t)(now - _winStart) >= _bucketMs && garde--) {
-      _winStart += _bucketMs;
-      _idx = (uint8_t)((_idx + 1) % GE_BUCKETS);
-      _bucket[_idx] = 0;
-    }
-    // Trou > fenêtre entière : tout est périmé.
-    if ((uint32_t)(now - _winStart) >= _fenetreMs) {
-      for (uint8_t i = 0; i < GE_BUCKETS; i++) _bucket[i] = 0;
-      _winStart = now;
-    }
+  static const uint8_t GE_SLOT_AUCUN = 0xFF;
+  // Anneau de GE_BUCKETS+1 seaux : un seau n'est remis à zéro qu'après
+  // (GE_BUCKETS+1) rotations, donc un événement reste compté AU MOINS
+  // _fenetreMs. Sans le +1, il restait compté 7/8 de fenêtre (26 250 ms
+  // au lieu de 30 000) et deux rafales de 4 passaient en 26 254 ms.
+  static const uint8_t GE_RING = (uint8_t)(GE_BUCKETS + 1);
+
+  // La concurrence demandée est ramenée dans [1, GE_SLOTS] : GE_SLOTS est
+  // une contrainte de compilation, pas une erreur de l'appelant.
+  static uint8_t borneConcurrence(uint8_t c) {
+    if (c < 1) return 1;
+    return (c > GE_SLOTS) ? (uint8_t)GE_SLOTS : c;
   }
 
-  uint16_t charge() const {
-    uint32_t s = 0;
-    for (uint8_t i = 0; i < GE_BUCKETS; i++) s += _bucket[i];
-    return (s > 0xFFFF) ? 0xFFFF : (uint16_t)s;
+  bool admitInterne(uint8_t poids, uint32_t taille, uint8_t& idx) {
+    idx = GE_SLOT_AUCUN;
+
+    // Échantillonnage mémoire HORS verrou : couper les interruptions
+    // pendant heap_caps_get_free_size() n'apporte rien et coûte (finding 41).
+    uint32_t heap = heapLibre();
+    uint32_t bloc = blocLibre();
+    uint32_t now  = millis();
+
+    GE_VERROU(&_mux);
+    bool xoff = enPression(heap, bloc, _heapXoff, _blocXoff);
+    _xoff = xoff;    // publié sur TOUTES les sorties (W4)
+
+    if (!_actif) {
+      // Protection désactivée : on laisse passer, mais le slot est FICTIF.
+      // Il est réellement alloué pour que le ticket soit « vrai » et que
+      // sortir() soit symétrique ; il n'est simplement pas mesuré.
+      // (L'ancien compteur global _slotsSansMesure attribuait la libération
+      //  à la mauvaise requête et fuyait un slot — findings 28 et 29.)
+      uint8_t i = slotLibre();
+      if (i != GE_SLOT_AUCUN) {
+        _slotBusy[i]   = true;
+        _slotFictif[i] = true;
+        _slotStart[i]  = now;
+        idx = i;
+        _actifs++;
+      }
+      _admis++;
+      GE_DEVERROU(&_mux);
+      return true;
+    }
+
+    if (poids == 0) poids = 1;
+
+    // 1. Cooldown post-reboot / post-erreur
+    if (_cooldownFin && (int32_t)(now - _cooldownFin) < 0) {
+      return refuserSousVerrou(GE_REFUS_BACKOFF);
+    }
+
+    // 2. Garde de démarrage
+    if (_gardeActive && ((heap < _gardeHeap) || (bloc < _gardeBloc))) {
+      return refuserSousVerrou(GE_REFUS_GARDE);
+    }
+
+    // 3. Poids au-delà du réglage (structurel)
+    if (poids > _poidsMax) {
+      return refuserSousVerrou(GE_REFUS_POIDS);
+    }
+
+    // 4. Pression mémoire : max effectif réduit
+    uint16_t maxEff = xoff ? _sousPression : _canaux;
+    if (poids > maxEff) {
+      return refuserSousVerrou(xoff ? GE_REFUS_PRESSION : GE_REFUS_POIDS);
+    }
+
+    // 5. Concurrence
+    if (_actifs >= _concurrence) {
+      return refuserSousVerrou(GE_REFUS_CONCURRENCE);
+    }
+
+    // 6. Taille du plus gros bloc alloué
+    if (taille) {
+      if (taille > _bodyMax) return refuserSousVerrou(GE_REFUS_BODY);
+      uint32_t part = (heap * _partHeap) / 100UL;
+      if (taille > part)     return refuserSousVerrou(GE_REFUS_BODY);
+    }
+
+    // 7. Fenêtre glissante pondérée
+    avancer(now);
+    if ((uint32_t)(charge() + poids) > maxEff) {
+      return refuserSousVerrou(GE_REFUS_FLUX);
+    }
+
+    // Admis : trouver un slot libre
+    uint8_t i = slotLibre();
+    if (i == GE_SLOT_AUCUN) {   // ne devrait pas arriver (contrôle 5)
+      return refuserSousVerrou(GE_REFUS_CONCURRENCE);
+    }
+
+    _slotBusy[i]   = true;
+    _slotFictif[i] = false;
+    _slotStart[i]  = now;
+    idx = i;
+
+    _bucket[_idx] = (uint16_t)(_bucket[_idx] + poids);
+    _actifs++;
+    _admis++;
+    _derniereActivite = now;
+    _refus = GE_REFUS_AUCUN;
+    GE_DEVERROU(&_mux);
+    return true;
   }
 
-  bool refuser(GE_Refus r) {
+  // ⚠️ Appelée VERROU TENU : elle rend le verrou elle-même.
+  bool refuserSousVerrou(GE_Refus r) {
     _refus = r;
     _rejetes++;
     switch (r) {
@@ -451,10 +728,42 @@ private:
       case GE_REFUS_BODY:        _rejBody++;        break;
       case GE_REFUS_BACKOFF:     _rejBackoff++;     break;
       case GE_REFUS_GARDE:       _rejGarde++;       break;
-      case GE_REFUS_DUREE:       _rejDuree++;       break;
       default: break;
     }
+    GE_DEVERROU(&_mux);
     return false;
+  }
+
+  uint8_t slotLibre() const {
+    for (uint8_t i = 0; i < GE_SLOTS; i++) if (!_slotBusy[i]) return i;
+    return GE_SLOT_AUCUN;
+  }
+
+  void viderFenetre(uint32_t now) {
+    for (uint8_t i = 0; i < GE_RING; i++) _bucket[i] = 0;
+    _idx = 0;
+    _winStart = now;
+    _fenetreVide = true;
+  }
+
+  void avancer(uint32_t now) {
+    if (!_fenetreVide) { _winStart = now; _fenetreVide = true; return; }
+    uint16_t garde = GE_RING;    // uint8_t tronquait à 256 → rotation morte
+    while ((uint32_t)(now - _winStart) >= _bucketMs && garde--) {
+      _winStart += _bucketMs;
+      _idx = (uint8_t)((_idx + 1) % GE_RING);
+      _bucket[_idx] = 0;
+    }
+    if ((uint32_t)(now - _winStart) >= _fenetreMs) {
+      for (uint8_t i = 0; i < GE_RING; i++) _bucket[i] = 0;
+      _winStart = now;
+    }
+  }
+
+  uint16_t charge() const {
+    uint32_t s = 0;
+    for (uint8_t i = 0; i < GE_RING; i++) s += _bucket[i];
+    return (s > 0xFFFFUL) ? 0xFFFF : (uint16_t)s;
   }
 
   // ── Configuration active ──────────────────────────────────────
@@ -476,14 +785,18 @@ private:
   uint8_t  _partHeap     = GE_PART_HEAP_DEF;
   bool     _gardeActive  = false;
 
-  // ── Fenêtre ───────────────────────────────────────────────────
-  uint16_t _bucket[GE_BUCKETS];
-  uint32_t _winStart = 0;
-  uint8_t  _idx      = 0;
+  // ── Fenêtre (anneau GE_BUCKETS+1) ─────────────────────────────
+  uint16_t _bucket[GE_BUCKETS + 1] = {};   // initialisé (C5)
+  uint32_t _winStart     = 0;
+  uint8_t  _idx          = 0;
+  bool     _fenetreVide  = false;
 
-  // ── Concurrence / durée ───────────────────────────────────────
-  uint8_t  _actifs   = 0;
-  uint32_t _reqStart = 0;
+  // ── Slots de concurrence (un temps de départ PAR slot) ────────
+  uint32_t _slotStart[GE_SLOTS] = {};
+  bool     _slotBusy[GE_SLOTS]  = {};
+  bool     _slotFictif[GE_SLOTS] = {};
+  uint8_t  _slotDernier  = GE_SLOT_AUCUN;
+  uint8_t  _actifs       = 0;
 
   // ── Backoff ───────────────────────────────────────────────────
   uint32_t _backoffBase = GE_BACKOFF_BASE_DEF;
@@ -495,39 +808,49 @@ private:
   uint32_t _derniereActivite = 0;
 
   // ── Compteurs ─────────────────────────────────────────────────
-  uint32_t _admis         = 0;
-  uint32_t _rejetes       = 0;
-  uint32_t _rejFlux       = 0;
-  uint32_t _rejPoids      = 0;
-  uint32_t _rejPression   = 0;
-  uint32_t _rejConcurrence= 0;
-  uint32_t _rejBody       = 0;
-  uint32_t _rejBackoff    = 0;
-  uint32_t _rejGarde      = 0;
-  uint32_t _rejDuree      = 0;
-  uint32_t _dureePire     = 0;
-  uint32_t _depassements  = 0;
+  uint32_t _admis          = 0;
+  uint32_t _rejetes        = 0;
+  uint32_t _rejFlux        = 0;
+  uint32_t _rejPoids       = 0;
+  uint32_t _rejPression    = 0;
+  uint32_t _rejConcurrence = 0;
+  uint32_t _rejBody        = 0;
+  uint32_t _rejBackoff     = 0;
+  uint32_t _rejGarde       = 0;
+  uint32_t _dureePire      = 0;
+  uint32_t _depassements   = 0;
 
   // ── État ──────────────────────────────────────────────────────
-  GE_Refus   _refus    = GE_REFUS_AUCUN;
+  GE_Refus    _refus   = GE_REFUS_AUCUN;
   GE_ProfilId _profil  = GE_PROFIL_AUTO;
-  bool       _actif    = true;
-  bool       _xoff     = false;
+  bool        _actif   = true;
+  bool        _xoff    = false;
 
   // ── Routes ────────────────────────────────────────────────────
   GE_RouteStat _routes[GE_ROUTES > 0 ? GE_ROUTES : 1] = {};
-  int8_t _routeCur = -1;
+#if GE_ROUTE_NOM_MAX > 0
+  char _routeNoms[GE_ROUTES > 0 ? GE_ROUTES : 1][GE_ROUTE_NOM_MAX] = {};
+#endif
+  int8_t _routeCur       = -1;
+  bool   _routesSaturees = false;
+
+#if defined(ESP32)
+  portMUX_TYPE _mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
 };
 
-// Cohérence de réglage.
-// NOTE : sousPression < poidsMax est LÉGITIME — sous pression mémoire, les
-// requêtes lourdes doivent être refusées. Le bug historique (Server_MCP
-// v1.3.1 « canaux 0/2 ») venait d'un message trompeur et d'un XOFF
-// permanent, pas de la valeur elle-même. D'où : sous pression on renvoie
-// GE_REFUS_PRESSION, hors pression GE_REFUS_POIDS (cause structurelle).
+// Définition du destructeur de ticket (Guard_ESP est maintenant complet).
+inline void GE_Ticket::liberer() {
+  if (_g && _idx != GE_SLOT_AUCUN) _g->sortir(_idx);
+  _g = nullptr;
+  _idx = GE_SLOT_AUCUN;
+}
+
+// Empreinte : un garde-fou qui grossit devient lui-même un risque mémoire.
+static_assert(sizeof(Guard_ESP) < 300, "sizeof(Guard_ESP) doit rester < 300 octets");
+
 static_assert(GE_SOUS_PRESSION_DEF >= 1, "GE_SOUS_PRESSION_DEF doit etre >= 1");
 static_assert(GE_POIDS_MAX_DEF >= 1,     "GE_POIDS_MAX_DEF doit etre >= 1");
-static_assert(GE_BUCKETS >= 2,           "GE_BUCKETS doit etre >= 2");
 static_assert(GE_CONCURRENCE_DEF >= 1,   "GE_CONCURRENCE_DEF doit etre >= 1");
 
 // Instance globale prête à l'emploi (une seule par firmware).

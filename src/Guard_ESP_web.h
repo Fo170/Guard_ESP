@@ -11,10 +11,15 @@
 //   GE_WebGuard        → ESP8266WebServer / WebServer (synchrone)
 //   GE_AsyncWebGuard   → AsyncWebServer (Coulometre)
 //
-// Usage synchrone (une ligne au début de CHAQUE handler) :
-//   if (!wguard.admit(server, 1, 400)) return;   // refus déjà envoyé
+// Usage (RAII, sûr en concurrence) :
+//   GE_Ticket t = wguard.admit(&server, 2, 192);
+//   if (!t) return;              // refus déjà envoyé (429/503)
 //   ... traitement ...
-//   wguard.fin();
+//   // libération automatique à la sortie de portée
+//
+// L'ancien couple admit()/fin() stockait l'état « ouvert » dans un booléen
+// PAR INSTANCE : deux requêtes simultanées l'écrasaient et un slot de
+// concurrence était perdu (mesuré : actifs=1 après 2 admits + 2 fins).
 // ════════════════════════════════════════════════════════════════
 
 #ifndef GUARD_ESP_WEB_H
@@ -25,13 +30,14 @@
 
 // ────────────────────────────────────────────────────────────────
 // Code HTTP selon la cause de refus
-//   429 Too Many Requests → rafale / backoff (le client peut réessayer)
-//   503 Service Unavailable → concurrence / pression / garde (patienter)
+//   429 Too Many Requests   → rafale (le client peut réessayer plus tard)
+//   503 Service Unavailable → refus permanent ou ressource indisponible
+// ⚠️ POIDS est un refus STRUCTUREL (l'outil est trop lourd pour l'état de
+//    flux) : réessayer ne changera rien → 503, pas 429.
 // ────────────────────────────────────────────────────────────────
 static inline uint16_t ge_codeHttp(GE_Refus r) {
   switch (r) {
     case GE_REFUS_FLUX:
-    case GE_REFUS_POIDS:
     case GE_REFUS_BACKOFF:
       return 429;
     default:
@@ -41,14 +47,13 @@ static inline uint16_t ge_codeHttp(GE_Refus r) {
 
 static inline const char* ge_messageRefus(GE_Refus r) {
   switch (r) {
-    case GE_REFUS_FLUX:        return "Trop de requetes — fenetre saturee";
+    case GE_REFUS_FLUX:        return "Trop de requetes - fenetre saturee";
     case GE_REFUS_POIDS:       return "Requete trop lourde pour la fenetre de flux";
-    case GE_REFUS_PRESSION:    return "Memoire insuffisante (XOFF) — patientez";
-    case GE_REFUS_CONCURRENCE: return "Trop de requetes simultanees — patientez";
+    case GE_REFUS_PRESSION:    return "Memoire insuffisante (XOFF) - patientez";
+    case GE_REFUS_CONCURRENCE: return "Trop de requetes simultanees - patientez";
     case GE_REFUS_BODY:        return "Reponse trop volumineuse pour la memoire";
-    case GE_REFUS_BACKOFF:     return "Service en cooldown — patientez";
+    case GE_REFUS_BACKOFF:     return "Service en cooldown - patientez";
     case GE_REFUS_GARDE:       return "Appareil non pret (memoire insuffisante)";
-    case GE_REFUS_DUREE:       return "Requete precedente trop longue";
     default:                   return "Refuse";
   }
 }
@@ -61,93 +66,96 @@ class GE_WebGuard {
 public:
   explicit GE_WebGuard(Guard_ESP& g) : _g(g) {}
 
-  // Retourne true = la requête est admise (slot acquis, à rendre via fin()).
-  bool admit(ServerType& srv, uint8_t poids = 1, uint32_t taille = 0) {
-    _ouvert = false;
-    if (_g.admit(poids, taille)) { _ouvert = true; return true; }
-    refuser(srv);
-    return false;
+  // Retourne un ticket : convertible en bool, libère le slot à sa destruction.
+  GE_Ticket admit(ServerType& srv, uint8_t poids = 1, uint32_t taille = 0) {
+    GE_Ticket t = _g.ticket(poids, taille);
+    if (!t) refuser(srv);
+    return t;
   }
 
   // Envoie la réponse de refus (429/503 + Retry-After + X-RateLimit-*).
   void refuser(ServerType& srv) {
     GE_Refus r = _g.refus();
     uint16_t code = ge_codeHttp(r);
-    char buf[24];
+    char buf[16];
 
-    snprintf(buf, sizeof(buf), "%lu", (unsigned long)((_g.retryAfterMs() + 999) / 1000));
-    srv.sendHeader("Retry-After", String(buf));
+    // Les en-têtes coûtent une String chacun : on ne les émet PAS quand
+    // l'appareil est déjà sous pression mémoire — c'est exactement le
+    // moment où allouer aggraverait le problème.
+    if (!_g.enPression()) {
+      snprintf(buf, sizeof(buf), "%lu", (unsigned long)((_g.retryAfterMs() + 999UL) / 1000UL));
+      srv.sendHeader("Retry-After", String(buf));
 
-    snprintf(buf, sizeof(buf), "%u", (unsigned)_g.canaux());
-    srv.sendHeader("X-RateLimit-Limit", String(buf));
-    snprintf(buf, sizeof(buf), "%u", (unsigned)_g.chargeCourante());
-    srv.sendHeader("X-RateLimit-Used", String(buf));
-    snprintf(buf, sizeof(buf), "%lu", (unsigned long)(_g.fenetreMs() / 1000));
-    srv.sendHeader("X-RateLimit-Window", String(buf));
-    srv.sendHeader("X-Guard-Reason", ge_messageRefus(r));
+      snprintf(buf, sizeof(buf), "%u", (unsigned)_g.canaux());
+      srv.sendHeader("X-RateLimit-Limit", String(buf));
 
+      snprintf(buf, sizeof(buf), "%u", (unsigned)_g.chargeCourante());
+      srv.sendHeader("X-RateLimit-Used", String(buf));
+
+      snprintf(buf, sizeof(buf), "%u", (unsigned)_g.creditRestant());
+      srv.sendHeader("X-RateLimit-Remaining", String(buf));
+
+      snprintf(buf, sizeof(buf), "%lu", (unsigned long)(_g.fenetreMs() / 1000UL));
+      srv.sendHeader("X-RateLimit-Window", String(buf));
+
+      srv.sendHeader("X-Guard-Reason", ge_messageRefus(r));
+    }
     srv.send(code, "text/plain", ge_messageRefus(r));
-  }
-
-  // À appeler en fin de handler admis : rend le slot et mesure la durée.
-  void fin() {
-    if (_ouvert) { _g.sortir(); _ouvert = false; }
   }
 
   Guard_ESP& guard() { return _g; }
 
 private:
   Guard_ESP& _g;
-  bool _ouvert = false;
 };
 
 // ════════════════════════════════════════════════════════════════
 // Adaptateur ASYNCHRONE : AsyncWebServer
+// Le type de réponse dépend du serveur : on utilise `auto*` pour ne pas
+// nommer un type imbriqué qui n'existe pas (l'ancienne version écrivait
+// `typename RequestType::Response`, ce qui ne compilait jamais).
 // ════════════════════════════════════════════════════════════════
 template <typename RequestType>
 class GE_AsyncWebGuard {
 public:
   explicit GE_AsyncWebGuard(Guard_ESP& g) : _g(g) {}
 
-  // Retourne true = admis. En cas de refus, la réponse est déjà envoyée.
-  bool admit(RequestType* req, uint8_t poids = 1, uint32_t taille = 0) {
-    _ouvert = false;
-    if (_g.admit(poids, taille)) { _ouvert = true; return true; }
-    refuser(req);
-    return false;
+  GE_Ticket admit(RequestType* req, uint8_t poids = 1, uint32_t taille = 0) {
+    GE_Ticket t = _g.ticket(poids, taille);
+    if (!t) refuser(req);
+    return t;
   }
 
   void refuser(RequestType* req) {
     GE_Refus r = _g.refus();
     uint16_t code = ge_codeHttp(r);
-    char buf[24];
+    char buf[16];
 
-    typename RequestType::Response* resp = req->beginResponse(code, "text/plain", ge_messageRefus(r));
-    if (resp) {
-      snprintf(buf, sizeof(buf), "%lu", (unsigned long)((_g.retryAfterMs() + 999) / 1000));
-      resp->addHeader("Retry-After", String(buf));
-      snprintf(buf, sizeof(buf), "%u", (unsigned)_g.canaux());
-      resp->addHeader("X-RateLimit-Limit", String(buf));
-      snprintf(buf, sizeof(buf), "%u", (unsigned)_g.chargeCourante());
-      resp->addHeader("X-RateLimit-Used", String(buf));
-      snprintf(buf, sizeof(buf), "%lu", (unsigned long)(_g.fenetreMs() / 1000));
-      resp->addHeader("X-RateLimit-Window", String(buf));
-      resp->addHeader("X-Guard-Reason", ge_messageRefus(r));
-      req->send(resp);
-    } else {
-      req->send(code, "text/plain", ge_messageRefus(r));
+    if (Guard_ESP::heapLibre() > _g.heapXoff() * 2UL) {
+      auto* resp = req->beginResponse(code, "text/plain", ge_messageRefus(r));
+      if (resp) {
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)((_g.retryAfterMs() + 999UL) / 1000UL));
+        resp->addHeader("Retry-After", String(buf));
+        snprintf(buf, sizeof(buf), "%u", (unsigned)_g.canaux());
+        resp->addHeader("X-RateLimit-Limit", String(buf));
+        snprintf(buf, sizeof(buf), "%u", (unsigned)_g.chargeCourante());
+        resp->addHeader("X-RateLimit-Used", String(buf));
+        snprintf(buf, sizeof(buf), "%u", (unsigned)_g.creditRestant());
+        resp->addHeader("X-RateLimit-Remaining", String(buf));
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)(_g.fenetreMs() / 1000UL));
+        resp->addHeader("X-RateLimit-Window", String(buf));
+        resp->addHeader("X-Guard-Reason", ge_messageRefus(r));
+        req->send(resp);
+        return;
+      }
     }
-  }
-
-  void fin() {
-    if (_ouvert) { _g.sortir(); _ouvert = false; }
+    req->send(code, "text/plain", ge_messageRefus(r));
   }
 
   Guard_ESP& guard() { return _g; }
 
 private:
   Guard_ESP& _g;
-  bool _ouvert = false;
 };
 
 #endif // GUARD_ESP_WEB_H
