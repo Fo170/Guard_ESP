@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include <functional>
 
 #define MALLOC_CAP_8BIT      (1u << 2)
 #define MALLOC_CAP_INTERNAL  (1u << 11)
@@ -127,6 +128,103 @@ public:
   char corpsRecu[128] = {};
 private:
   FauxAsyncResponse _resp;
+};
+
+// ── Faux couple TCP : serveur / client / requête (GE_TcpGuard) ───
+// Reproduit la surface réellement utilisée par Guard_ESP_tcp.h :
+//   serveur  : onClient(callback, void* arg)
+//   client   : setRxTimeout, write, close(bool), abort()
+//   requête  : create(serveur*, client*) + onDisconnect(callback)
+//
+// ⚠️ Sur l'appareil, AsyncClient est ALLOUÉ SUR LE TAS : le garde fait
+//    `delete c` sur le chemin de refus (comportement du framework). Le faux
+//    client doit donc être créé avec `new` — un objet de pile provoquerait
+//    « free(): invalid pointer ». Les tests lisent le résultat dans les
+//    compteurs GLOBAUX ci-dessous, jamais dans l'objet (il est détruit).
+// Compteurs globaux du faux framework (visibles par les tests).
+extern int g_creations;      // AsyncWebServerRequest::create() appelés
+extern int g_deconnexions;   // callbacks onDisconnect enregistrés
+extern bool g_createEchoue;  // force l'échec d'allocation
+extern std::function<void(void)> g_derniereDeconnexion;
+extern char   g_dernierEcrit[256];
+extern size_t g_dernierEcritLen;
+extern bool   g_dernierClose;   // dernier close(bool) reçu
+extern bool   g_dernierAbort;   // dernier abort() reçu
+
+class FauxTcpClient {
+public:
+  FauxTcpClient()  { vivants++; }
+  ~FauxTcpClient() { vivants--; }
+
+  void setRxTimeout(int s) { rxTimeout = s; }
+  void write(const char* d, size_t n) {
+    if (n > sizeof(g_dernierEcrit) - 1) n = sizeof(g_dernierEcrit) - 1;
+    memcpy(g_dernierEcrit, d, n);
+    g_dernierEcrit[n] = '\0';
+    g_dernierEcritLen = n;
+    octetsEcrits += n;
+  }
+  void close(bool immediat) { ferme = true; fermetureImmediate = immediat; g_dernierClose = immediat; }
+  void abort() { avorte = true; g_dernierAbort = true; }
+
+  static int vivants;
+
+  int    rxTimeout          = 0;
+  bool   ferme              = false;
+  bool   fermetureImmediate = false;
+  bool   avorte             = false;
+  size_t octetsEcrits       = 0;
+};
+
+// Clients possédés par le « framework » (créés par create(), libérés par
+// fauxTcpLiberer()). Déclarés après FauxTcpClient : le type est complet ici.
+extern FauxTcpClient* g_admis[8];
+extern int g_nbAdmis;
+
+class FauxTcpRequest {
+public:
+  static FauxTcpRequest* create(void* /*serveur*/, FauxTcpClient* client) {
+    g_creations++;
+    if (g_createEchoue) return nullptr;
+    // Le framework prend possession du client : on le mémorise pour pouvoir
+    // le libérer en fin de test (sinon LeakSanitizer signale une « fuite »
+    // qui n'est que l'absence de serveur à arrêter).
+    if (client && g_nbAdmis < 8) g_admis[g_nbAdmis++] = client;
+    static FauxTcpRequest r;
+    r._onDisconnect = nullptr;
+    return &r;
+  }
+  void onDisconnect(std::function<void(void)> fn) {
+    g_deconnexions++;
+    _onDisconnect = fn;
+    g_derniereDeconnexion = fn;   // pour simuler une fermeture côté client
+  }
+
+  std::function<void(void)> _onDisconnect;
+};
+
+inline void fauxTcpDeconnecter() { if (g_derniereDeconnexion) g_derniereDeconnexion(); }
+
+// Simule l'arrêt du serveur : libère les clients admis (possédés par le
+// framework sur l'appareil). À appeler en fin de test.
+inline void fauxTcpLiberer() {
+  for (int i = 0; i < g_nbAdmis; i++) delete g_admis[i];
+  g_nbAdmis = 0;
+}
+
+class FauxTcpServeur {
+public:
+  void onClient(std::function<void(void*, FauxTcpClient*)> cb, void* arg) {
+    _cb = cb;
+    _arg = arg;
+    installations++;
+  }
+  // Simule une connexion entrante (ce que fait AsyncServer::_accept).
+  void connecter(FauxTcpClient* c) { if (_cb) _cb(_arg, c); }
+
+  std::function<void(void*, FauxTcpClient*)> _cb;
+  void* _arg          = nullptr;
+  int   installations = 0;
 };
 
 #endif // ARDUINO_H

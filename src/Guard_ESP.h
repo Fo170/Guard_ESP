@@ -37,7 +37,9 @@
 #include <string.h>
 #include <stdio.h>
 
-#define GE_VERSION "1.1.0"
+// Version de la librairie (source UNIQUE — agrégée par liste_lib.h des projets)
+#define __GUARD_ESP_H_VERSION__ "1.2.0"
+#define GE_VERSION __GUARD_ESP_H_VERSION__
 
 // Signale à l'appelant qu'ignorer le résultat d'admit() est un bug :
 // un ticket détruit immédiatement rend le slot AVANT le traitement.

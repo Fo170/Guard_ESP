@@ -5,6 +5,71 @@ Format : une section par version, avec les vérifications associées.
 
 ---
 
+## 2026-10-29 — v1.2.0 (plafond de connexions TCP)
+
+Ajout d'un **troisième niveau de protection** : `Guard_ESP_tcp.h`.
+
+### Pourquoi
+
+`Guard_ESP` (noyau) et `Guard_ESP_web` décident **dans le handler**, donc
+**après** que le framework a créé un `AsyncWebServerRequest`. Or c'est
+précisément cette création qui tue un ESP8266 sous pression : mesuré le
+02/10/2026 sur le projet Coulométre — allocation de 32 o refusée dans
+`AsyncWebServerRequest::_parseReqHeader()` → `std::bad_alloc` → panic →
+**reboot loop toutes les 5-20 s**. Un refus qui a lieu dans le handler est
+déjà trop tard : la requête est allouée.
+
+`GE_TcpGuard` décide dans `onClient()`, donc **avant toute allocation** :
+une connexion refusée ici ne crée aucun objet.
+
+### Nouveautés
+
+| Élément | Rôle |
+|---|---|
+| `GE_TcpGuard<ServerType, ClientType, RequestType>` | Plafond de connexions simultanées + garde mémoire, décidés au niveau TCP |
+| `installer()` | Remplace le `onClient` du framework (à appeler **après** le constructeur du serveur) |
+| `installer(Enregistreur)` | Variante pour un serveur qui n'expose pas `onClient` (`AsyncWebServer` : le handler est sur `_server`, protégé) — l'appelant fournit l'enregistreur |
+| `setGardeMemoire(bool)` | **Arrêt du service** quand `Guard_ESP::gardePassee()` est faux (RAM ou plus gros bloc contigu insuffisant) — activé par défaut |
+| `setMaxConnexions(n)` | Plafond ; `0` est ramené à `1` (jamais de coupure totale, l'OTA reste joignable) |
+| `resume(buf, len)` | Diagnostic sans `String` (même convention que le noyau) |
+| `__GUARD_ESP_H_VERSION__` | Macro de version (convention Fo170) — `GE_VERSION` en dérive ; lue par `liste_src` des projets |
+
+### Invariants respectés
+
+- **Zéro allocation sur le chemin de refus** : l'en-tête 503 est construit
+  dans un tampon de **pile** (`snprintf`, 192 o). Aucune `String`, aucun
+  `new` — ce chemin doit réussir même à 200 o de heap.
+- Comportement d'origine **reproduit** à l'admission :
+  `setRxTimeout(3)` puis `RequestType::create()`, et `abort()` + `delete`
+  si la création échoue.
+- Sur refus : `close(true)` (**immédiat**) puis `delete`.
+  `close(false)` serait différé → **use-after-free**.
+- Compteur rendu sur **tous** les chemins : échec d'allocation **et**
+  déconnexion (`onDisconnect`). Un compteur jamais rendu interdit toute
+  nouvelle connexion jusqu'au reboot.
+- **Aucun `#include` du framework** dans ce header : les types sont des
+  paramètres de gabarit → pas de conflit d'enum `HTTPMethod`, et test
+  possible sur l'hôte avec de faux serveurs.
+- Ordre des refus : **garde mémoire AVANT concurrence**. Sous pression, la
+  cause affichée doit être la mémoire — sinon on cherche au mauvais endroit.
+
+### Vérifications
+
+`192/192` vérifications hôte, `0` échec, `0` warning (`-Wall -Wextra`),
+`AddressSanitizer` + `UBSan` propres (aucune fuite, aucun `free` invalide).
+
+| Test | Ce qu'il verrouille |
+|---|---|
+| `T38` | 4ᵉ connexion refusée : **aucune requête créée**, `close(true)`, 503 + `Retry-After` + `X-Guard-Reason`, pic mémorisé |
+| `T39` | Compteur rendu à la déconnexion ; pas de sous-débordement `uint8_t` sur double déconnexion |
+| `T40` | Échec d'allocation → `abort()` + `delete`, compteur rendu, le service repart |
+| `T41` | RAM insuffisante → `GE_REFUS_GARDE` ; **priorité sur la concurrence** ; fragmentation seule suffit ; désactivation possible |
+| `T42` | Un refus ne crée aucune requête ; refus < 192 o ; plafond `0` → `1` ; `resume()` borné |
+| `T43` | Surcharge `installer(Enregistreur)` : `AsyncWebServer` n'expose pas `onClient` (le handler vit sur son membre protégé `_server`) — sans elle, l'adaptateur ne peut PAS être installé sur un serveur réel (défaut trouvé au build du Coulométre) |
+| `T43` | Surcharge `installer(Enregistreur)` : `AsyncWebServer` n'expose pas `onClient` (handler sur `_server`, protégé) — sans elle, l'adaptateur ne peut pas être installé sur un serveur réel |
+
+---
+
 ## 2026-10-22 — v1.1.0 (cycle de chasse aux bugs n°1)
 
 Premier cycle `code-reviews-openfox`. **5 findings critiques** et **17
