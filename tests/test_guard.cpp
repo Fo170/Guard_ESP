@@ -10,6 +10,7 @@
 #include "Guard_ESP_web.h"
 #include "Guard_ESP_print.h"
 #include "Guard_ESP_mcp.h"
+#include "Guard_ESP_tcp.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -17,6 +18,18 @@ uint32_t g_fakeMillis = 1;
 uint32_t g_fakeHeap   = 4700;
 uint32_t g_fakeBloc   = 3700;
 FakeESP  ESP;
+
+int g_creations = 0;
+int g_deconnexions = 0;
+bool g_createEchoue = false;
+std::function<void(void)> g_derniereDeconnexion;
+char   g_dernierEcrit[256] = {};
+size_t g_dernierEcritLen = 0;
+bool   g_dernierClose = false;
+bool   g_dernierAbort = false;
+int    FauxTcpClient::vivants = 0;
+FauxTcpClient* g_admis[8];
+int    g_nbAdmis = 0;
 
 static int g_total = 0;
 static int g_ok    = 0;
@@ -605,6 +618,190 @@ static void t37_tick_concurrence() {
   check("cause = CONCURRENCE", g.refus() == GE_REFUS_CONCURRENCE);
 }
 
+// ── T38 : plafond TCP — le refus a lieu AVANT toute allocation ──
+// Protège : reboot loop du 02/10/2026 (alloc 32 o refusée dans
+// _parseReqHeader() → bad_alloc → panic). Un refus DANS le handler est
+// déjà trop tard : la requête a été allouée.
+// ⚠️ Les faux clients sont créés par `new` : le garde fait `delete c` sur
+//    le chemin de refus, comme le framework avec un vrai AsyncClient.
+static void t38_plafond_tcp() {
+  printf("\nT38 — plafond TCP : refus avant allocation (OOM 02/10/2026)\n");
+  Guard_ESP g; reset(g);
+  FauxTcpServeur srv;
+  GE_TcpGuard<FauxTcpServeur, FauxTcpClient, FauxTcpRequest> tcp(g, srv, 3);
+  tcp.installer();
+  check("installer() pose le handler onClient", srv.installations == 1);
+
+  g_creations = 0; g_deconnexions = 0;
+  g_dernierEcrit[0] = '\0'; g_dernierClose = false; g_dernierAbort = false;
+
+  FauxTcpClient* c1 = new FauxTcpClient();
+  FauxTcpClient* c2 = new FauxTcpClient();
+  FauxTcpClient* c3 = new FauxTcpClient();
+  srv.connecter(c1); srv.connecter(c2); srv.connecter(c3);
+  check("3 connexions admises", tcp.actifs() == 3);
+  check("3 requetes creees", g_creations == 3);
+  check("setRxTimeout(3) reproduit le framework", c1->rxTimeout == GE_TCP_RX_TIMEOUT);
+  check("onDisconnect arme sur chaque requete", g_deconnexions == 3);
+
+  srv.connecter(new FauxTcpClient());   // 4e : refusée puis détruite
+  check("4e refusee : AUCUNE requete creee", g_creations == 3);
+  check("4e fermee immediatement close(true)", g_dernierClose == true);
+  check("4e ne compte pas dans actifs", tcp.actifs() == 3);
+  check("compteur refuses = 1", tcp.refuses() == 1);
+  check("cause = CONCURRENCE", tcp.refus() == GE_REFUS_CONCURRENCE);
+  check("refus en 503", strstr(g_dernierEcrit, "503 Service Unavailable") != nullptr);
+  check("refus avec Retry-After", strstr(g_dernierEcrit, "Retry-After: ") != nullptr);
+  check("refus avec X-Guard-Reason: concurrence",
+        strstr(g_dernierEcrit, "X-Guard-Reason: concurrence") != nullptr);
+  check("refus avec Content-Length: 0", strstr(g_dernierEcrit, "Content-Length: 0") != nullptr);
+  check("pic memorise", tcp.pic() == 3);
+
+  // Les 3 clients admis restent vivants (le framework en prend possession).
+  check("aucune fuite : 3 clients vivants", FauxTcpClient::vivants == 3);
+  fauxTcpLiberer();
+  check("arret du serveur : 0 client vivant", FauxTcpClient::vivants == 0);
+}
+
+// ── T39 : le compteur est rendu à la déconnexion ────────────────
+// Protège : compteur jamais rendu → plus aucune connexion acceptée
+// jusqu'au reboot (symptôme « 200 + corps vide » du Coulométre v5.30).
+static void t39_deconnexion() {
+  printf("\nT39 — compteur TCP rendu a la deconnexion\n");
+  Guard_ESP g; reset(g);
+  FauxTcpServeur srv;
+  GE_TcpGuard<FauxTcpServeur, FauxTcpClient, FauxTcpRequest> tcp(g, srv, 2);
+  tcp.installer();
+
+  FauxTcpClient* c1 = new FauxTcpClient();
+  srv.connecter(c1);
+  check("1 connexion active", tcp.actifs() == 1);
+  fauxTcpDeconnecter();
+  check("compteur rendu : 0 actif", tcp.actifs() == 0);
+  fauxTcpDeconnecter();   // déconnexion en trop (client qui disparaît)
+  check("pas de sous-debordement (uint8_t) : 0 actif", tcp.actifs() == 0);
+
+  srv.connecter(new FauxTcpClient());
+  check("une nouvelle connexion est acceptee apres", tcp.actifs() == 1);
+  fauxTcpDeconnecter();
+  fauxTcpLiberer();
+}
+
+// ── T40 : échec d'allocation → abort + delete, compteur rendu ───
+static void t40_echec_alloc() {
+  printf("\nT40 — echec d'allocation : abort + delete, compteur rendu\n");
+  Guard_ESP g; reset(g);
+  FauxTcpServeur srv;
+  GE_TcpGuard<FauxTcpServeur, FauxTcpClient, FauxTcpRequest> tcp(g, srv, 3);
+  tcp.installer();
+
+  g_dernierAbort = false;
+  g_createEchoue = true;
+  srv.connecter(new FauxTcpClient());   // détruit par le garde (abort)
+  g_createEchoue = false;
+  check("client avorte (abort)", g_dernierAbort == true);
+  check("compteur rendu : 0 actif", tcp.actifs() == 0);
+  check("echec d'allocation compte", tcp.echecsAlloc() == 1);
+
+  srv.connecter(new FauxTcpClient());
+  check("le service repart apres l'echec", tcp.actifs() == 1);
+  fauxTcpDeconnecter();
+  fauxTcpLiberer();
+}
+
+// ── T41 : garde mémoire = arrêt du service (priorité sur concurrence) ──
+static void t41_garde_memoire() {
+  printf("\nT41 — garde memoire : le service s'arrete au lieu de planter\n");
+  Guard_ESP g; reset(g);
+  FauxTcpServeur srv;
+  GE_TcpGuard<FauxTcpServeur, FauxTcpClient, FauxTcpRequest> tcp(g, srv, 3);
+  tcp.installer();
+
+  g_fakeHeap = 2500;   // sous gardeHeap (3000, profil ESP8266)
+  g_dernierEcrit[0] = '\0';
+  srv.connecter(new FauxTcpClient());
+  check("refus quand la RAM est insuffisante", tcp.refuses() == 1);
+  check("cause = GARDE", tcp.refus() == GE_REFUS_GARDE);
+  check("refusGarde compte", tcp.refusGarde() == 1);
+  check("aucune connexion admise", tcp.actifs() == 0);
+  check("X-Guard-Reason: garde", strstr(g_dernierEcrit, "X-Guard-Reason: garde") != nullptr);
+
+  // Priorité : même saturé en concurrence, la cause affichée reste la mémoire.
+  g_fakeHeap = 4700; g_fakeBloc = 3700;
+  srv.connecter(new FauxTcpClient());
+  srv.connecter(new FauxTcpClient());
+  srv.connecter(new FauxTcpClient());
+  check("3 connexions admises (RAM revenue)", tcp.actifs() == 3);
+  g_fakeBloc = 500;    // sous gardeBloc (1200) : fragmentation
+  srv.connecter(new FauxTcpClient());
+  check("fragmentation -> GARDE, pas CONCURRENCE", tcp.refus() == GE_REFUS_GARDE);
+
+  // Désactivation explicite : on repasse en refus de concurrence.
+  g_fakeBloc = 3700;
+  tcp.setGardeMemoire(false);
+  g_fakeHeap = 1000;
+  srv.connecter(new FauxTcpClient());
+  check("garde desactivee : la RAM ne bloque plus", tcp.refus() == GE_REFUS_CONCURRENCE);
+  g_fakeHeap = 4700;
+  fauxTcpLiberer();
+}
+
+// ── T42 : contrat du refus (zéro allocation) et bornes ──────────
+static void t42_contrat_tcp() {
+  printf("\nT42 — contrat du refus TCP : zero allocation, bornes\n");
+  Guard_ESP g; reset(g);
+  FauxTcpServeur srv;
+  GE_TcpGuard<FauxTcpServeur, FauxTcpClient, FauxTcpRequest> tcp(g, srv, 1);
+  tcp.installer();
+
+  g_creations = 0; g_dernierEcritLen = 0;
+  srv.connecter(new FauxTcpClient());   // admise
+  srv.connecter(new FauxTcpClient());   // refusée
+  check("un refus ne cree aucune requete", g_creations == 1);
+  check("le refus tient dans le tampon de pile",
+        g_dernierEcritLen > 0 && g_dernierEcritLen < 192);
+
+  tcp.setMaxConnexions(0);
+  check("plafond 0 ramene a 1 (jamais de coupure totale)", tcp.maxConnexions() == 1);
+
+  char buf[128];
+  size_t n = tcp.resume(buf, sizeof(buf));
+  check("resume() ecrit sans String", n > 0 && strstr(buf, "tcp actifs=") != nullptr);
+  check("resume() respecte la borne len-1", n <= sizeof(buf) - 1);
+  check("resume() sur tampon nul ne plante pas", tcp.resume(nullptr, 10) == 0);
+  fauxTcpDeconnecter();
+  fauxTcpLiberer();
+}
+
+// ── T43 : surcharge installer(Enregistreur) ─────────────────────
+// Protège : AsyncWebServer n'expose PAS onClient (le handler vit sur son
+// membre protégé `_server`). Sans cette surcharge, l'adaptateur ne peut pas
+// être installé sur le serveur réel du Coulométre — défaut trouvé au build.
+static void t43_installer_enregistreur() {
+  printf("\nT43 — installer(Enregistreur) : serveur sans onClient public\n");
+  Guard_ESP g; reset(g);
+  FauxTcpServeur srv;
+  GE_TcpGuard<FauxTcpServeur, FauxTcpClient, FauxTcpRequest> tcp(g, srv, 2);
+
+  int appels = 0;
+  // L'enregistreur reçoit le callback et le pose où il veut (ici : sur le
+  // serveur, comme le fait LimitedWebServer::onClientConn()).
+  tcp.installer([&srv, &appels](std::function<void(void*, FauxTcpClient*)> cb) {
+    appels++;
+    srv.onClient(cb, &srv);
+  });
+  check("l'enregistreur est appele une fois", appels == 1);
+  check("le handler est bien pose", srv.installations == 1);
+
+  srv.connecter(new FauxTcpClient());
+  check("la connexion est admise via cet enregistreur", tcp.actifs() == 1);
+  srv.connecter(new FauxTcpClient());
+  srv.connecter(new FauxTcpClient());
+  check("le plafond s'applique aussi", tcp.refuses() == 1);
+  fauxTcpDeconnecter();
+  fauxTcpLiberer();
+}
+
 int main() {
   printf("=== Tests Guard_ESP v%s ===\n", GE_VERSION);
   t1_fenetre();      t2_poids();        t3_pression();
@@ -620,6 +817,9 @@ int main() {
   t31_print();       t32_exemple();     t33_credit();
   t34_compteurs();   t35_refus_texte();  t36_ticket_inactif();
   t37_tick_concurrence();
+  t38_plafond_tcp(); t39_deconnexion(); t40_echec_alloc();
+  t41_garde_memoire(); t42_contrat_tcp();
+  t43_installer_enregistreur();
   printf("\n=== %d/%d tests OK ===\n", g_ok, g_total);
   return (g_ok == g_total) ? 0 : 1;
 }

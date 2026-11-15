@@ -4,7 +4,7 @@ Bibliothèque de **protection** pour **ESP8266** et **ESP32** : elle décide
 d'**admettre, ralentir ou rejeter** une requête **avant** que l'appareil n'ait
 consommé la moindre ressource fatale.
 
-> **Auteur** : Olivier FOURNET · **Licence** : GPL-3.0-only · **Version** : 1.1.0
+> **Auteur** : Olivier FOURNET · **Licence** : GPL-3.0-only · **Version** : 1.2.0
 > **Compatibilité** : ESP8266 (NodeMCU, Wemos D1) et ESP32 (DevKit, Wemos D1 Mini ESP32)
 > sous **Arduino IDE** et **PlatformIO**
 > **Header-only** · **zéro allocation dynamique** · `sizeof(Guard_ESP)` = **256 octets**
@@ -54,7 +54,7 @@ Détail complet, taxonomie de **49 problèmes** (8 familles) et **12 bonnes prat
 
 ```ini
 lib_deps =
-    https://github.com/Fo170/Guard_ESP.git@^1.0.0
+    https://github.com/Fo170/Guard_ESP.git@^1.2.0
 ```
 
 ### Arduino IDE
@@ -108,6 +108,61 @@ Le refus envoie `Retry-After`, `X-RateLimit-Limit`, `X-RateLimit-Used`,
 `X-RateLimit-Remaining`, `X-RateLimit-Window` et `X-Guard-Reason` — **sauf**
 si l'appareil est déjà sous pression mémoire, où aucun en-tête n'est
 construit (pas de `String` au pire moment).
+
+### 2 bis. TCP — plafond AVANT toute allocation
+
+```cpp
+#include <Guard_ESP.h>
+#include <Guard_ESP_tcp.h>
+
+GE_TcpGuard<AsyncWebServer, AsyncClient, AsyncWebServerRequest>
+    tcp(guard, server, 3);   // 3 connexions simultanées
+
+// APRÈS la construction du serveur (installer() REMPLACE son onClient)
+tcp.installer();
+```
+
+`GE_WebGuard` (niveau handler) décide **après** la création de
+l'`AsyncWebServerRequest` : sur un ESP8266 sous pression, c'est déjà trop tard —
+l'allocation a échoué et le panic est déclenché (`_parseReqHeader()`,
+mesuré le 02/10/2026 : reboot loop toutes les 5-20 s). `GE_TcpGuard` décide
+dans `onClient()`, donc **avant** toute allocation.
+
+Deux refus, dans cet ordre :
+
+1. **garde mémoire** — `guard.gardePassee()` faux (heap ou plus gros bloc
+   contigu sous le seuil) → **arrêt du service** : mieux vaut ne pas servir
+   que planter ;
+2. **plafond de connexions** — `setMaxConnexions(n)`.
+
+Le refus est **construit sur la pile** (`snprintf`, 192 o) : aucune `String`,
+aucun `new`, donc il réussit même à 200 o de heap. Il renvoie `503`,
+`Retry-After`, `X-RateLimit-Limit` et `X-Guard-Reason`.
+
+```cpp
+tcp.setGardeMemoire(false);   // diagnostic : ne pas couper sous pression
+tcp.setMaxConnexions(5);
+char buf[128]; tcp.resume(buf, sizeof(buf));   // diagnostic, sans String
+```
+
+⚠️ `AsyncWebServer` n'expose **pas** `onClient` : le handler vit sur son membre
+protégé `_server`. Pour ce cas, ré-exposer le handler dans une classe dérivée et
+passer l'**enregistreur** :
+
+```cpp
+class MonServeur : public AsyncWebServer {
+public:
+  MonServeur(uint16_t p) : AsyncWebServer(p) {}
+  void onClientConn(AcConnectHandler cb) { _server.onClient(cb, this); }
+};
+
+GE_TcpGuard<MonServeur, AsyncClient, AsyncWebServerRequest> tcp(guard, server, 3);
+tcp.installer([](AcConnectHandler cb) { server.onClientConn(cb); });
+```
+
+⚠️ Le garde doit vivre **aussi longtemps que le serveur** (les callbacks
+`onDisconnect` capturent son adresse) : instance globale ou membre, jamais
+un objet de pile dans `setup()`.
 
 ### 3. MCP — délégation à `Server_MCP`
 
@@ -207,7 +262,7 @@ trop lourd pour l'état de flux) : réessayer ne changera rien, d'où 503.
 
 ---
 
-## Les 7 risques couverts
+## Les 8 risques couverts
 
 | # | Risque | Mécanisme |
 |---|---|---|
@@ -218,6 +273,7 @@ trop lourd pour l'état de flux) : réessayer ne changera rien, d'où 503.
 | 5 | Fragmentation | XON/XOFF sur le **plus gros bloc contigu** |
 | 6 | Tempête de retries | backoff + cooldown après reboot |
 | 7 | Démarrage en RAM faible | garde `H_ref` |
+| 8 | OOM **avant** le handler (création de la requête) | `GE_TcpGuard` : plafond TCP, refus sans allocation |
 
 ---
 
@@ -247,7 +303,7 @@ g++ -std=c++17 -Wall -Wextra -I tests -I src tests/test_guard.cpp -o test_guard
 ./test_guard
 ```
 
-**149 vérifications**, chacune référençant le problème réel qu'elle protège.
+**192 vérifications**, chacune référençant le problème réel qu'elle protège.
 Empreinte vérifiée : `sizeof(Guard_ESP) = 256 octets` (garanti par `static_assert`).
 
 Compilation croisée des exemples :
@@ -280,10 +336,11 @@ cd examples/02_mcp_basic && pio run -e esp12e && pio run -e esp32dev
 | `src/Guard_ESP.h` | noyau : fenêtre, pression, concurrence, garde, stats |
 | `src/Guard_ESP_web.h` | filtre `ESP8266WebServer` / `WebServer` / `AsyncWebServer` |
 | `src/Guard_ESP_mcp.h` | adaptateur `Server_MCP` |
+| `src/Guard_ESP_tcp.h` | plafond de connexions TCP + garde mémoire **avant** toute allocation |
 | `src/Guard_ESP_print.h` | `Print` streamé sans `String` |
 | `examples/01_web_basic` | web + page streamée |
 | `examples/02_mcp_basic` | intégration `Server_MCP` |
-| `tests/` | 149 vérifications hôte + shim Arduino (dont faux serveurs web) |
+| `tests/` | 192 vérifications hôte + shim Arduino (dont faux serveurs web et faux couple TCP) |
 | `LIVRE_BLANC.md` | taxonomie, bonnes pratiques, valeurs typiques |
 | `analyse.md` / `criteres.md` | cycle de chasse aux bugs n°1 |
 | `AGENTS.md` | invariants à ne pas casser, pièges connus |

@@ -15,6 +15,7 @@ GE_AsyncWebGuard	KEYWORD1
 GE_McpFlow	KEYWORD1
 GE_ServerPrint	KEYWORD1
 GE_ChunkPrint	KEYWORD1
+GE_TcpGuard	KEYWORD1
 
 #######################################
 # Methods and Functions (KEYWORD2)
