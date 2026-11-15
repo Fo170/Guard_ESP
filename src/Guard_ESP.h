@@ -37,8 +37,17 @@
 #include <string.h>
 #include <stdio.h>
 
+// Chien de garde de boucle : Ticker s'exécute dans le contexte SYS du SDK sur
+// ESP8266 (et dans la tâche du timer sur ESP32), donc il continue de tourner
+// même quand loop() est bloquée dans un appel I2C / 1-Wire / HTTP sans timeout.
+// C'est la seule construction capable de sortir d'un gel applicatif : un test
+// pollé depuis loop() (Schedule, millis()) ne s'exécute jamais dans ce cas.
+#if defined(ESP8266) || defined(ESP32)
+  #include <Ticker.h>
+#endif
+
 // Version de la librairie (source UNIQUE — agrégée par liste_lib.h des projets)
-#define __GUARD_ESP_H_VERSION__ "1.2.0"
+#define __GUARD_ESP_H_VERSION__ "1.2.1"
 #define GE_VERSION __GUARD_ESP_H_VERSION__
 
 // Signale à l'appelant qu'ignorer le résultat d'admit() est un bug :
@@ -90,6 +99,9 @@ static_assert(GE_ROUTE_NOM_MAX == 0 || GE_ROUTE_NOM_MAX >= 4,
 #define GE_PART_HEAP_DEF       25        // % du heap max par réponse
 #define GE_BACKOFF_BASE_DEF    1000UL
 #define GE_BACKOFF_MAX_DEF     30000UL
+// Chien de garde de boucle : 60 s sans preuve de vie de loop() -> redémarrage.
+// 0 = désactivé. Réglable par setChienDeGardeBoucle().
+#define GE_BOUCLE_SEUIL_DEF    60000UL
 #define GE_COOLDOWN_REBOOT_DEF 60000UL   // laisse WiFi/NTP se stabiliser
 #define GE_INACTIVITE_DEF      300000UL  // 5 min sans activité = suspect
 
@@ -409,6 +421,9 @@ public:
   // DÉCRÉMENTÉ par slot réellement libéré — le remettre à 0 laissait
   // passer plus de requêtes que _concurrence (finding 30).
   void tick() {
+#if defined(ESP8266) || defined(ESP32)
+    _derniereBoucleMs() = millis();   // preuve de vie pour le chien de garde
+#endif
     if (_dureeMaxMs == 0) return;
     uint32_t limite = _dureeMaxMs * 4UL;
     uint32_t now = millis();
@@ -433,6 +448,85 @@ public:
   uint32_t inactiviteMs() const { return millis() - _derniereActivite; }
 
   bool inactif() const { return _inactSeuil && (inactiviteMs() > _inactSeuil); }
+
+  // ── Chien de garde de boucle (indépendant de loop()) ──────────
+  //
+  // POURQUOI : `inactif()` ci-dessus est pollé depuis loop(). Si la boucle est
+  // bloquée DANS un appel (I2C qui ne répond pas, 1-Wire sans timeout, HTTP
+  // sans setTimeout), le test n'est jamais atteint et la carte reste muette
+  // indéfiniment. Un Ticker s'exécute dans le contexte SYS du SDK et échappe
+  // donc au gel applicatif : c'est lui qui redémarre.
+  //
+  // USAGE :
+  //   setup() : guard.setChienDeGardeBoucle();      // 60 s par défaut
+  //   loop()  : guard.boucleVivante();              // ou guard.tick()
+  //
+  // ⚠️ Le seuil doit rester SUPÉRIEUR à la plus longue itération légitime de
+  //    loop(). Un cycle qui dure 100 s (20 pushs HTTP à 5 s) redémarrerait la
+  //    carte en boucle avec un seuil de 60 s : borner d'abord les timeouts.
+  // ⚠️ Suspendre pendant une OTA : guard.suspendreChienDeGarde(true).
+
+  /** Preuve de vie de loop(). Appelée par tick() ; peut être appelée seule. */
+  void boucleVivante() {
+#if defined(ESP8266) || defined(ESP32)
+    _derniereBoucleMs() = millis();
+#endif
+  }
+
+  /** Active le chien de garde. seuilMs = 0 le désactive. */
+  void setChienDeGardeBoucle(uint32_t seuilMs = GE_BOUCLE_SEUIL_DEF) {
+#if defined(ESP8266) || defined(ESP32)
+    _boucleSeuilMs()   = seuilMs;
+    _boucleSuspendue() = false;
+    if (seuilMs == 0) { _ticBoucle().detach(); return; }
+    _derniereBoucleMs() = millis();
+    // Contrôle au quart du seuil, borné à [1 s ; 30 s] : assez fin pour
+    // détecter un gel sans réveiller la radio inutilement.
+    uint32_t periode = seuilMs / 4UL;
+    if (periode < 1000UL)  periode = 1000UL;
+    if (periode > 30000UL) periode = 30000UL;
+    _ticBoucle().attach_ms(periode, []() { _controleBoucle(); });
+#else
+    (void)seuilMs;
+#endif
+  }
+
+  /** Suspend / reprend le chien de garde (ex. pendant une OTA). */
+  void suspendreChienDeGarde(bool suspendu = true) {
+#if defined(ESP8266) || defined(ESP32)
+    _boucleSuspendue() = suspendu;
+    if (!suspendu) _derniereBoucleMs() = millis();   // on repart du présent
+#else
+    (void)suspendu;
+#endif
+  }
+
+  /** true si le chien de garde est armé. */
+  bool chienDeGardeActif() const {
+#if defined(ESP8266) || defined(ESP32)
+    return _boucleSeuilMs() != 0 && !_boucleSuspendue();
+#else
+    return false;
+#endif
+  }
+
+  /** Seuil courant en ms (0 = désactivé). */
+  uint32_t seuilChienDeGarde() const {
+#if defined(ESP8266) || defined(ESP32)
+    return _boucleSeuilMs();
+#else
+    return 0;
+#endif
+  }
+
+  /** Nombre de redémarrages déclenchés par le chien de garde depuis le boot. */
+  uint32_t redemarragesBoucle() const {
+#if defined(ESP8266) || defined(ESP32)
+    return _boucleRestarts();
+#else
+    return 0;
+#endif
+  }
 
   // ── Compteurs par route ───────────────────────────────────────
   // ⚠️ `nom` doit désigner une chaîne de durée de vie >= celle du programme
@@ -783,6 +877,46 @@ private:
   uint32_t _gardeHeap    = 0;
   uint32_t _gardeBloc    = 0;
   uint32_t _inactSeuil   = GE_INACTIVITE_DEF;
+
+  // ── Chien de garde de boucle ──────────────────────────────────
+  //
+  // ⚠️ État STATIQUE et non membres d'instance : la librairie garantit
+  //    `sizeof(Guard_ESP) < 300 octets` (static_assert en fin de fichier).
+  //    Un Ticker pèse ~50 octets ; l'ajouter aux membres ferait exploser la
+  //    garantie. Les statiques de fonction locale sont uniques par programme,
+  //    ce qui est exactement la sémantique voulue (un seul chien de garde).
+#if defined(ESP8266) || defined(ESP32)
+  static Ticker& _ticBoucle() {
+    static Ticker t;
+    return t;
+  }
+  static volatile uint32_t& _derniereBoucleMs() {
+    static volatile uint32_t v = 0;
+    return v;
+  }
+  static volatile uint32_t& _boucleSeuilMs() {
+    static volatile uint32_t v = 0;
+    return v;
+  }
+  static volatile bool& _boucleSuspendue() {
+    static volatile bool v = false;
+    return v;
+  }
+  static volatile uint32_t& _boucleRestarts() {
+    static volatile uint32_t v = 0;
+    return v;
+  }
+
+  // Exécuté dans le contexte SYS du SDK (ESP8266) / tâche timer (ESP32) :
+  // hors de loop(), donc atteint même si la boucle est bloquée.
+  static void _controleBoucle() {
+    if (_boucleSuspendue()) return;
+    if (_boucleSeuilMs() == 0) return;
+    if ((uint32_t)(millis() - _derniereBoucleMs()) <= _boucleSeuilMs()) return;
+    _boucleRestarts() = _boucleRestarts() + 1;
+    ESP.restart();
+  }
+#endif
   uint8_t  _concurrence  = GE_CONCURRENCE_DEF;
   uint8_t  _partHeap     = GE_PART_HEAP_DEF;
   bool     _gardeActive  = false;

@@ -5,6 +5,59 @@ Format : une section par version, avec les vérifications associées.
 
 ---
 
+## 2026-11-16 — v1.2.1 (chien de garde de boucle)
+
+Ajout d'un filet de sécurité **indépendant de `loop()`** : `setChienDeGardeBoucle()`.
+
+### Pourquoi
+
+`inactif()` et `tick()` sont pollés depuis `loop()`. Si la boucle est bloquée
+**dans** un appel — I2C qui ne répond pas, 1-Wire sans timeout, `HTTPClient::GET()`
+sans `setTimeout()` — le test n'est jamais atteint et la carte reste muette
+indéfiniment. Constaté le 15/11/2026 sur `ESP8266_Surveillance_Batterie` : 20 pushs
+Domoticz par cycle, ~5 s de timeout par appel → ~100 s bloqués par itération,
+`wifiManager.update()` jamais appelé, carte injoignable au ping, et le
+redémarrage de minuit **jamais atteint** (il exige en plus une horloge NTP valide,
+donc le WiFi… qui est justement tombé).
+
+### Nouveautés
+
+| Élément | Rôle |
+|---|---|
+| `setChienDeGardeBoucle(seuilMs = 60000)` | Arme un `Ticker` en **contexte SYS du SDK** (ESP8266) / tâche timer (ESP32). Seuil réglable, `0` = désactivé. Défaut **60 s**. |
+| `boucleVivante()` | Preuve de vie explicite. `tick()` la met à jour automatiquement. |
+| `suspendreChienDeGarde(bool)` | À appeler autour d'une OTA (un transfert bloque légitimement la boucle). |
+| `chienDeGardeActif()` / `seuilChienDeGarde()` | État courant. |
+| `redemarragesBoucle()` | Compteur de redémarrages déclenchés depuis le boot. |
+| `GE_BOUCLE_SEUIL_DEF` | 60000 ms. |
+
+### Choix techniques
+
+- **`Ticker::attach_ms()` et non `attach_ms_scheduled()`** : le second est
+  documenté « *callback will be called at following loop()* » — donc bloqué
+  comme la boucle. Seul `attach_ms()` s'exécute en contexte SYS.
+- **État en statiques de fonction locale**, pas en membres : la librairie
+  garantit `sizeof(Guard_ESP) < 300` (static_assert). Un `Ticker` pèse ~50 o ;
+  l'ajouter aux membres cassait la garantie (mesuré : static_assert en échec).
+  Les statiques de fonction sont uniques par programme — sémantique voulue.
+- **Opt-in** : rien n'est armé tant que `setChienDeGardeBoucle()` n'est pas
+  appelé. Aucun projet existant ne change de comportement.
+
+### Vérifications
+
+- `esp12e` : SUCCESS, `sizeof(Guard_ESP)` toujours < 300 o.
+- `esp32dev` : SUCCESS.
+- `relais_WIFI_ESP8266_4_canaux` (intégration réelle, `symlink://`) : SUCCESS,
+  RAM 48 768 o (59,5 %), flash 474 495 o — soit **+8 o de RAM** vs 1.2.0.
+
+### ⚠️ Prérequis d'usage
+
+Le seuil doit rester **supérieur à la plus longue itération légitime** de
+`loop()`. Un cycle de 100 s redémarrerait la carte en boucle avec 60 s :
+borner d'abord les timeouts réseau.
+
+---
+
 ## 2026-10-29 — v1.2.0 (plafond de connexions TCP)
 
 Ajout d'un **troisième niveau de protection** : `Guard_ESP_tcp.h`.
